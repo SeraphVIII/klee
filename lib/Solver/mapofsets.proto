@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package klee.mapofsets;
+
+message Header {
+  uint64 magic = 1;           // 0x4d41504f53455453ULL ("MAPOSETS")
+  uint32 version = 2;         // 1
+  uint32 root_id = 3;
+  uint64 total_nodes = 4;
+  uint64 values_blob_size = 5;
+  uint32 chunk_size = 6;      // nodes per chunk
+  uint64 directory_offset = 7;
+  uint64 directory_size = 8;
+}
+
+message Child {
+  bytes key = 1;              // serialized K
+  uint32 child_id = 2;
+}
+
+message Node {
+  bool is_end_of_set = 1;
+  uint64 value_offset = 2;    // 0 = no value
+  repeated Child children = 3; // sorted by key
+}
+
+message NodeChunk {
+  uint32 first_node_id = 1;
+  uint32 node_count = 2;
+  repeated Node nodes = 3;
+}
+
+message MapOfSetsFile {
+  Header header = 1;
+  bytes values_blob = 2;
+  // Node chunks follow in file after parsing header+blob
+}
