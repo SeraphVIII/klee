@@ -30,6 +30,19 @@ using namespace klee;
 using namespace llvm;
 
 namespace {
+
+cl::opt<std::string> DiskCexCacheFile(
+    "disk-cex-cache",
+    cl::desc("Path to read-only disk cex cache file (empty=disabled)"),
+    cl::init(""),
+    cl::cat(SolvingCat));
+
+cl::opt<unsigned> DiskCexCacheAssignmentTableSize(
+    "disk-cex-assignment-table-size",
+    cl::desc("Size of assignment table for disk cache"),
+    cl::init(10000),
+    cl::cat(SolvingCat));
+
 cl::opt<bool> DebugCexCacheCheckBinding(
     "debug-cex-cache-check-binding", cl::init(false),
     cl::desc("Debug the correctness of the counterexample "
@@ -70,6 +83,10 @@ class CexCachingSolver : public SolverImpl {
   // memo table
   assignmentsTable_ty assignmentsTable;
 
+  // Disk cache support
+  std::unique_ptr<DiskCexCache> diskCexCache_;
+  std::vector<Assignment*> diskAssignmentTable_;
+
   bool searchForAssignment(KeyType &key, 
                            Assignment *&result);
   
@@ -83,8 +100,7 @@ class CexCachingSolver : public SolverImpl {
   bool getAssignment(const Query& query, Assignment *&result);
   
 public:
-  CexCachingSolver(std::unique_ptr<Solver> solver)
-      : solver(std::move(solver)) {}
+  CexCachingSolver(std::unique_ptr<Solver> solver);
   ~CexCachingSolver();
 
   bool computeTruth(const Query &, bool &isValid) override;
@@ -183,7 +199,34 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
       return true;
     }
   }
-  
+
+  if (diskCexCache_) {
+    if (CexCacheTryAll) {
+      Assignment *diskResult = nullptr;
+      if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
+        result = diskResult;
+        return true;
+      }
+      if (!diskResult && diskCexCache_->findSubset(key, diskResult)) {
+        result = diskResult;
+        return true;
+      }
+    } else {
+      Assignment *diskResult = nullptr;
+      if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
+        result = diskResult;
+        return true;
+      }
+      if (!diskResult) {
+        diskCexCache_->findSubset(key, diskResult);
+        if (diskResult) {
+          result = diskResult;
+          return true;
+        }
+      }
+    }
+  }
+
   return false;
 }
 
@@ -261,12 +304,26 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 }
 
 ///
+CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
+    : solver(std::move(solver)) {
+  // Initialize disk cache if enabled
+  if (!DiskCexCacheFile.empty()) {
+    diskAssignmentTable_.resize(DiskCexCacheAssignmentTableSize);
+    diskCexCache_ = std::make_unique<DiskCexCache>(
+        DiskCexCacheFile.getValue(),
+        diskAssignmentTable_);
+  }
+}
+
 
 CexCachingSolver::~CexCachingSolver() {
   cache.clear();
   for (assignmentsTable_ty::iterator it = assignmentsTable.begin(), 
          ie = assignmentsTable.end(); it != ie; ++it)
     delete *it;
+
+  for (auto a : diskAssignmentTable_)
+    if (a) delete a;
 }
 
 bool CexCachingSolver::computeValidity(const Query& query,
