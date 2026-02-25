@@ -4,7 +4,7 @@
 
 using namespace klee;
 
-void dfsAssign(const MapOfSetsDiskBuilder::UBTree::Node *src,
+void MapOfSetsDiskBuilder::dfsAssign(const MapOfSetsDiskBuilder::UBTree::Node *src,
                std::vector<BuildNode> &outNodes) {
   uint32_t id = outNodes.size();
   outNodes.emplace_back();
