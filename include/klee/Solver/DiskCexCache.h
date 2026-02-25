@@ -4,8 +4,8 @@
 #define DISK_CEX_CACHE_H
 
 #include "DiskMapOfSets.h"
+#include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Solver/Assignment.h"
 
 #include <memory>
 #include <unordered_map>

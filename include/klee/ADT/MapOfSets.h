@@ -53,10 +53,12 @@ namespace klee {
     template<class Predicate>
     V *findSubset(const std::set<K> &set, const Predicate &p);
 
-  private:
     class Node;
+  private:
 
     Node root;
+
+    friend class MapOfSetsDiskBuilder;
 
     template<class Iterator, class Vector>
     void findSubsets(Node *n, 
@@ -94,7 +96,6 @@ namespace klee {
 
     V value;
 
-  private:
     bool isEndOfSet;
     std::map<K, Node> children;
     
