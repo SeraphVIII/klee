@@ -42,7 +42,7 @@ private:
   
   struct Chunk {
     uint64_t offset;
-    size_t size;
+    uint32_t size;
     NodeChunk* parsed;
   };
   std::unordered_map<uint32_t, Chunk> chunk_cache_; // chunk_id -> Chunk

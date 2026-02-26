@@ -14,6 +14,8 @@
 #include "klee/Expr/Expr.h"
 #include "klee/Solver/Solver.h"
 #include "klee/Solver/SolverCmdLine.h"
+#include "klee/Solver/DiskMapOfSets.h"
+#include "klee/Solver/MapOfSetsDiskBuilder.h"
 
 #include "llvm/ADT/StringExtras.h"
 
@@ -166,5 +168,66 @@ TEST(SolverTest, Evaluation) {
   testOpcode<SgtExpr>(*solver);
   testOpcode<SgeExpr>(*solver);
 }
+
+
+// Add this test case at the end, before the closing brace:
+TEST(DiskMapOfSetsTest, RoundTrip) {
+  // 1. Build in-memory MapOfSets
+  klee::MapOfSets<std::string,std::string> mem;
+  mem.insert({"a"}, "UNSAT");
+  mem.insert({"a","b"}, "SAT:1");
+  mem.insert({"a","c"}, "SAT:2");
+  mem.insert({"x"}, "SAT:42");
+
+  // 2. Serialize to disk
+  const std::string testFile = "test_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+
+  // 3. Load from disk
+  klee::mapofsets::DiskMapOfSets disk(testFile);
+
+  // 4. Test exact lookup
+  {
+    auto exact = disk.lookup({"a"});
+    ASSERT_TRUE(exact.has_value());
+    EXPECT_EQ("UNSAT", *exact);
+  }
+
+  // 5. Test supersets({"a"})
+  {
+    auto supers = disk.supersets({"a"});
+    ASSERT_EQ(3, supers.size());  // {"a"}, {"a","b"}, {"a","c"}
+    std::set<std::string> foundValues;
+    for (const auto& e : supers) {
+      foundValues.insert(e.value);
+      if (e.key_set == std::set<std::string>{"a"})
+        EXPECT_EQ("UNSAT", e.value);
+    }
+    EXPECT_NE(foundValues.find("SAT:1"), foundValues.end());
+    EXPECT_NE(foundValues.find("SAT:2"), foundValues.end());
+  }
+
+  // 6. Test subsets({"a","b","c"})
+  {
+    auto subs = disk.subsets({"a","b","c"});
+    ASSERT_EQ(1, subs.size());
+    EXPECT_EQ("UNSAT", subs[0].value);
+    EXPECT_EQ(std::set<std::string>{"a"}, subs[0].key_set);
+  }
+
+  // 7. Test empty/miss
+  {
+    auto miss = disk.lookup({"missing"});
+    EXPECT_FALSE(miss.has_value());
+  }
+
+  printf("✅ DiskMapOfSets roundtrip PASSED\n");
+}
+
+// Cleanup test file (optional)
+TEST(DiskMapOfSetsTest, Cleanup) {
+  std::remove("test_disk_cache.mapo");
+}
+
 
 }
