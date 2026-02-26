@@ -227,7 +227,7 @@ void DiskMapOfSets::find_subsets(
   const auto &node = get_node(node_id);
   if (node.is_end_of_set()) {
     std::string v = read_value(node.value_offset());
-    if (v == "UNSAT") {
+    if (v.rfind("UNSAT", 0) == 0) {
       results.push_back(Entry{accum, std::move(v)});
     }
   }

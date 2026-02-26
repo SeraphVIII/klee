@@ -224,6 +224,72 @@ TEST(DiskMapOfSetsTest, RoundTrip) {
   printf("✅ DiskMapOfSets roundtrip PASSED\n");
 }
 
+// Updated test with correct semantics (subsets = UNSAT only)
+TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
+  klee::MapOfSets<std::string,std::string> mem;
+
+  // UNSAT prefixes (subsets hits)
+  mem.insert({}, "UNSAT_root");            // Empty set = UNSAT
+  mem.insert({"a"}, "UNSAT_a");            // Prefix = UNSAT
+  mem.insert({"a", "b"}, "UNSAT_ab");      // Deeper UNSAT
+
+  // SAT leaves (exact/supersets hits)
+  mem.insert({"a", "b", "c"}, "SAT_abc");
+  mem.insert({"x"}, "SAT_x");
+  mem.insert({"x", "y"}, "SAT_xy");
+
+  const std::string testFile = "complex_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+
+  klee::mapofsets::DiskMapOfSets disk(testFile);
+
+  // Exact lookups (UNSAT + SAT)
+  EXPECT_EQ("UNSAT_root", *disk.lookup({}));
+  EXPECT_EQ("UNSAT_a", *disk.lookup({"a"}));
+  EXPECT_EQ("UNSAT_ab", *disk.lookup({"a","b"}));
+  EXPECT_EQ("SAT_abc", *disk.lookup({"a","b","c"}));
+  EXPECT_EQ("SAT_x", *disk.lookup({"x"}));
+
+  // supersets({"a"}) → ALL cached supersets (UNSAT + SAT)
+  {
+    auto supers = disk.supersets({"a"});
+    ASSERT_EQ(3u, supers.size());  // {}, isn't a superset of {"a"}
+    std::set<std::string> values;
+    for (const auto& e : supers) values.insert(e.value);
+
+    EXPECT_TRUE(values.count("UNSAT_a"));
+    EXPECT_TRUE(values.count("UNSAT_ab"));
+    EXPECT_TRUE(values.count("SAT_abc"));
+  }
+
+  // subsets({"a","b","c"}) → UNSAT subsets only
+  {
+    auto subs = disk.subsets({"a", "b", "c"});
+    ASSERT_EQ(3u, subs.size());  // {}, {"a"}, {"a","b"}
+
+    // Compare returned key_sets exactly
+    std::set<std::set<std::string>> got;
+    for (const auto& e : subs) {
+      EXPECT_TRUE(e.value.rfind("UNSAT", 0) == 0); // starts with "UNSAT"
+      got.insert(e.key_set);
+    }
+
+    EXPECT_TRUE(got.count(std::set<std::string>{}));
+    EXPECT_TRUE(got.count(std::set<std::string>{"a"}));
+    EXPECT_TRUE(got.count(std::set<std::string>{"a","b"}));
+  }
+
+  // subsets({"x","y"}) → UNSAT subsets (none)
+  {
+    auto subs = disk.subsets({"x", "y"});
+    ASSERT_EQ(1u, subs.size());
+    EXPECT_TRUE(subs[0].key_set.empty());
+    EXPECT_TRUE(subs[0].value.rfind("UNSAT", 0) == 0);
+  }
+
+  unlink(testFile.c_str());
+}
+
 // Cleanup test file (optional)
 TEST(DiskMapOfSetsTest, Cleanup) {
   std::remove("test_disk_cache.mapo");
