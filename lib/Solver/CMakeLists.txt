@@ -13,6 +13,7 @@ add_library(kleaverSolver
   CachingSolver.cpp
   CexCachingSolver.cpp
   ConstantDivision.cpp
+  ConstraintCanonicalizer.cpp
   ConstructSolverChain.cpp
   CoreSolver.cpp
   DiskCexCache.cpp

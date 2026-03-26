@@ -18,6 +18,7 @@
 #include "klee/Support/OptionCategories.h"
 #include "klee/Statistics/TimerStatIncrementer.h"
 #include "klee/Solver/SolverImpl.h"
+#include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/SolverStats.h"
 #include "klee/Support/ErrorHandling.h"
