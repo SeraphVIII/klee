@@ -31,7 +31,8 @@ klee::ref<Expr> canonicalizeExprTree(klee::ref<Expr> e);
 /// Canonicalize a whole constraint set.
 CanonicalizationResult
 canonicalizeConstraintSet(const std::vector<klee::ref<Expr>> &constraints,
-                          ExprBuilder &builder);
+                          ExprBuilder &builder,
+                          ArrayCache &arrayCache);
 
 /// Deterministic textual serialization of canonicalized constraints.
 std::string serializeCanonicalConstraints(

@@ -12,48 +12,57 @@
 
 using namespace klee;
 
-using namespace klee;
-
 ///===----------------------------------------------------------------------===///
 /// ExprCanonicalOrder
 ///===----------------------------------------------------------------------===///
 
-bool ExprCanonicalOrder::operator()(const ref<Expr> &a,
-                                    const ref<Expr> &b) const {
-  if (a.get() == b.get())
-    return false;
+bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
+                                          const ref<Expr> &b) const {
+  if (a.get() == b.get()) return false;
+  if (a->getKind() != b->getKind()) return a->getKind() < b->getKind();
+  if (a->getWidth() != b->getWidth()) return a->getWidth() < b->getWidth();
 
-  if (a->getKind() != b->getKind())
-    return a->getKind() < b->getKind();
+  // For constants, compare the value directly — fully deterministic.
+  if (a->getKind() == Expr::Constant) {
+    const ConstantExpr *ca = cast<ConstantExpr>(a);
+    const ConstantExpr *cb = cast<ConstantExpr>(b);
+    return ca->getAPValue().ult(cb->getAPValue());
+  }
 
-  if (a->getWidth() != b->getWidth())
-    return a->getWidth() < b->getWidth();
+  // For reads, compare array names then the index.
+  if (a->getKind() == Expr::Read) {
+    const ReadExpr *ra = cast<ReadExpr>(a);
+    const ReadExpr *rb = cast<ReadExpr>(b);
+    int cmp = ra->updates.root->name.compare(rb->updates.root->name);
+    if (cmp != 0) return cmp < 0;
+    return operator()(ra->index, rb->index);
+  }
 
   unsigned ak = a->getNumKids();
   unsigned bk = b->getNumKids();
-  if (ak != bk)
-    return ak < bk;
+  if (ak != bk) return ak < bk;
 
   for (unsigned i = 0; i < ak; ++i) {
-    const ref<Expr> &akid = a->getKid(i);
-    const ref<Expr> &bkid = b->getKid(i);
-    if (operator()(akid, bkid))
-      return true;
-    if (operator()(bkid, akid))
-      return false;
+    if (operator()(a->getKid(i), b->getKid(i))) return true;
+    if (operator()(b->getKid(i), a->getKid(i))) return false;
   }
 
-  return a->hash() < b->hash();
+  // Truly structurally identical — not less-than.
+  return false;
 }
 
 ///===----------------------------------------------------------------------===///
 /// Alpha-renaming support
 ///===----------------------------------------------------------------------===///
 
-/// Visitor that assigns deterministic positions to Arrays based on first
-/// appearance during DFS.
 namespace {
 
+///===----------------------------------------------------------------------===//
+/// Collects Arrays in deterministic DFS order, assigning each a position
+/// index based on first appearance. This order is used to generate stable
+/// canonical names (A0, A1, A2, ...) independent of original array names
+/// or allocation order.
+///===----------------------------------------------------------------------===//
 class ArrayOrderCollector : public ExprVisitor {
   std::map<const Array *, unsigned> &order_;
   unsigned &nextIndex_;
@@ -61,47 +70,81 @@ class ArrayOrderCollector : public ExprVisitor {
 public:
   ArrayOrderCollector(std::map<const Array *, unsigned> &order,
                       unsigned &nextIndex)
-      : ExprVisitor(true), order_(order), nextIndex_(nextIndex) {}
+      : ExprVisitor(/*recursive=*/true), order_(order), nextIndex_(nextIndex) {}
 
   Action visitRead(const ReadExpr &re) override {
     const Array *root = re.updates.root;
     if (root && !order_.count(root))
       order_[root] = nextIndex_++;
+
+    for (ref<UpdateNode> un = re.updates.head; un; un = un->next) {
+      visit(un->index);
+      visit(un->value);
+    }
+
     return ExprVisitor::visitRead(re);
   }
 };
 
+///===----------------------------------------------------------------------===//
+/// Rewrites every ReadExpr whose root Array appears in subst_, replacing it
+/// with the corresponding canonical Array. Also walks the full UpdateList
+/// chain so that symbolic writes (array updates) are substituted correctly.
+///
+/// subst_ is the forwardArrayMap from CanonicalizationResult:
+///   original Array*  -->  canonical Array*  (e.g. arr_foo --> A2)
+///===----------------------------------------------------------------------===//
 class ArraySubstitutionVisitor : public ExprVisitor {
   const std::map<const Array *, const Array *> &subst_;
 
 public:
-  ArraySubstitutionVisitor(
+  explicit ArraySubstitutionVisitor(
       const std::map<const Array *, const Array *> &subst)
-      : ExprVisitor(true), subst_(subst) {}
+      : ExprVisitor(/*recursive=*/true), subst_(subst) {}
 
   Action visitRead(const ReadExpr &re) override {
     const UpdateList &ul = re.updates;
     const Array *root = ul.root;
+
+    // Look up the root array. If it isn't in subst_ we still need to
+    // rebuild if the update chain contains expressions that reference
+    // other arrays that *are* in subst_.
     auto it = subst_.find(root);
-    if (it == subst_.end())
-      return ExprVisitor::visitRead(re);
+    const Array *newRoot = (it != subst_.end()) ? it->second : root;
 
-    const Array *newRoot = it->second;
-    UpdateList newUL(newRoot, ul.head);
+    // Rebuild the update chain oldest-first (head is most recent write,
+    // so we collect into a vector and replay in reverse).
+    //
+    // Example: if the chain is  [write idx2 val2] -> [write idx1 val1] -> nil
+    // we want to replay write idx1 first, then write idx2, so the rebuilt
+    // chain has the same logical meaning.
+    std::vector<ref<UpdateNode>> nodes;
+    for (ref<UpdateNode> un = ul.head; un; un = un->next)
+      nodes.push_back(un);
 
-    ref<Expr> newIndex = re.index;
-    newIndex = visit(newIndex);
+    UpdateList newUL(newRoot, nullptr);
+    for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit) {
+      ref<UpdateNode> un = *rit;
+      // visit() recursively applies this substitution to sub-expressions,
+      // so any nested array reads inside the index/value are also renamed.
+      ref<Expr> newIdx = visit(un->index);
+      ref<Expr> newVal = visit(un->value);
+      newUL.extend(newIdx, newVal);
+    }
 
-    ref<Expr> n = ReadExpr::create(newUL, newIndex);
-    return Action::changeTo(n);
+    // Substitute inside the read index as well.
+    ref<Expr> newIndex = visit(re.index);
+
+    return Action::changeTo(ReadExpr::create(newUL, newIndex));
   }
 };
 
 } // anonymous namespace
 
 ///===----------------------------------------------------------------------===///
-/// Expression tree canonicalization
+/// Expression tree canonicalization (static helpers)
 ///===----------------------------------------------------------------------===///
+
 static bool isCommutativeKind(Expr::Kind k) {
   switch (k) {
   case Expr::Add:
@@ -110,6 +153,7 @@ static bool isCommutativeKind(Expr::Kind k) {
   case Expr::Xor:
   case Expr::Mul:
   case Expr::Eq:
+  case Expr::Ne:
     return true;
   default:
     return false;
@@ -118,21 +162,77 @@ static bool isCommutativeKind(Expr::Kind k) {
 
 static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
                                  const std::vector<ref<Expr>> &kids) {
-  Expr::Kind k = orig->getKind();
-  switch (k) {
-  case Expr::Add: return AddExpr::create(kids[0], kids[1]);
-  case Expr::And: return AndExpr::create(kids[0], kids[1]);
-  case Expr::Or:  return OrExpr::create(kids[0], kids[1]);
-  case Expr::Xor: return XorExpr::create(kids[0], kids[1]);
-  case Expr::Mul: return MulExpr::create(kids[0], kids[1]);
-  case Expr::Eq:  return EqExpr::create(kids[0], kids[1]);
-  default:
+  switch (orig->getKind()) {
+  // --- commutative / associative ---
+  case Expr::Add:  return AddExpr::create(kids[0], kids[1]);
+  case Expr::And:  return AndExpr::create(kids[0], kids[1]);
+  case Expr::Or:   return OrExpr::create(kids[0], kids[1]);
+  case Expr::Xor:  return XorExpr::create(kids[0], kids[1]);
+  case Expr::Mul:  return MulExpr::create(kids[0], kids[1]);
+  case Expr::Eq:   return EqExpr::create(kids[0], kids[1]);
+
+  // --- comparisons ---
+  case Expr::Ne:   return NeExpr::create(kids[0], kids[1]);
+  case Expr::Ult:  return UltExpr::create(kids[0], kids[1]);
+  case Expr::Ule:  return UleExpr::create(kids[0], kids[1]);
+  case Expr::Slt:  return SltExpr::create(kids[0], kids[1]);
+  case Expr::Sle:  return SleExpr::create(kids[0], kids[1]);
+
+  // --- arithmetic ---
+  case Expr::Sub:  return SubExpr::create(kids[0], kids[1]);
+  case Expr::UDiv: return UDivExpr::create(kids[0], kids[1]);
+  case Expr::SDiv: return SDivExpr::create(kids[0], kids[1]);
+  case Expr::URem: return URemExpr::create(kids[0], kids[1]);
+  case Expr::SRem: return SRemExpr::create(kids[0], kids[1]);
+
+  // --- shifts ---
+  case Expr::Shl:  return ShlExpr::create(kids[0], kids[1]);
+  case Expr::LShr: return LShrExpr::create(kids[0], kids[1]);
+  case Expr::AShr: return AShrExpr::create(kids[0], kids[1]);
+
+  // --- casts ---
+  case Expr::ZExt: return ZExtExpr::create(kids[0], orig->getWidth());
+  case Expr::SExt: return SExtExpr::create(kids[0], orig->getWidth());
+
+  // --- misc ---
+  case Expr::Select:
+    return SelectExpr::create(kids[0], kids[1], kids[2]);
+  case Expr::Concat:
+    return ConcatExpr::create(kids[0], kids[1]);
+  case Expr::Extract: {
+    // Extract carries offset and width as metadata, not kids.
+    const ExtractExpr *ee = cast<ExtractExpr>(orig);
+    return ExtractExpr::create(kids[0], ee->offset, ee->width);
+  }
+
+  // --- leaves (should not reach here since getNumKids()==0) ---
+  case Expr::Constant:
+  case Expr::Read:
+    // ReadExpr kids are only the index; update list is handled separately
+    // by ArraySubstitutionVisitor — do not rebuild here.
     return orig;
+
+  default:
+    llvm_unreachable("rebuildWithKids: unhandled expression kind");
   }
 }
 
-/// Forward declaration
-klee::ref<Expr> canonicalizeExprTree(klee::ref<Expr> e);
+// Only called for commutative/associative kinds, so the list is short.
+static ref<Expr> rebuildWithKind(Expr::Kind k,
+                                 const ref<Expr> &a,
+                                 const ref<Expr> &b) {
+  switch (k) {
+  case Expr::Add:  return AddExpr::create(a, b);
+  case Expr::And:  return AndExpr::create(a, b);
+  case Expr::Or:   return OrExpr::create(a, b);
+  case Expr::Xor:  return XorExpr::create(a, b);
+  case Expr::Mul:  return MulExpr::create(a, b);
+  case Expr::Eq:   return EqExpr::create(a, b);
+  case Expr::Ne:   return NeExpr::create(a, b);
+  default:
+    llvm_unreachable("rebuildWithKind: not a binary commutative kind");
+  }
+}
 
 static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   if (!isCommutativeKind(e->getKind()))
@@ -157,17 +257,14 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   }
 
   for (auto &c : elems)
-    c = klee::canonicalizeExprTree(c);  // <-- add `klee::` here
+    c = klee::canonicalizeExprTree(c);
 
   std::sort(elems.begin(), elems.end(), cmp);
 
   while (elems.size() > 1) {
     std::vector<ref<Expr>> next;
-    for (size_t i = 0; i + 1 < elems.size(); i += 2) {
-      ref<Expr> a = elems[i];
-      ref<Expr> b = elems[i + 1];
-      next.push_back(rebuildWithKids(elems[i], {a, b}));
-    }
+    for (size_t i = 0; i + 1 < elems.size(); i += 2)
+      next.push_back(rebuildWithKind(k, elems[i], elems[i + 1]));
     if (elems.size() & 1)
       next.push_back(elems.back());
     elems.swap(next);
@@ -175,6 +272,12 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
 
   return elems[0];
 }
+
+///===----------------------------------------------------------------------===///
+/// Public API — all inside namespace klee so symbols match the header
+///===----------------------------------------------------------------------===///
+
+namespace klee {
 
 ref<Expr> canonicalizeExprTree(ref<Expr> e) {
   if (e.isNull())
@@ -186,10 +289,8 @@ ref<Expr> canonicalizeExprTree(ref<Expr> e) {
 
   std::vector<ref<Expr>> kids;
   kids.reserve(n);
-  for (unsigned i = 0; i < n; ++i) {
-    ref<Expr> child = e->getKid(i);
-    kids.push_back(klee::canonicalizeExprTree(child)); // fully qualified
-  }
+  for (unsigned i = 0; i < n; ++i)
+    kids.push_back(canonicalizeExprTree(e->getKid(i)));
 
   if (isCommutativeKind(e->getKind())) {
     ref<Expr> tmp = rebuildWithKids(e, kids);
@@ -199,13 +300,10 @@ ref<Expr> canonicalizeExprTree(ref<Expr> e) {
   return rebuildWithKids(e, kids);
 }
 
-///===----------------------------------------------------------------------===
-/// Constraint set canonicalization
-///===----------------------------------------------------------------------===///
-
 CanonicalizationResult
 canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
-                          ExprBuilder &builder) {
+                          ExprBuilder &builder,
+                          ArrayCache &arrayCache) {
   CanonicalizationResult res;
   res.constraints = constraints;
 
@@ -218,7 +316,6 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   for (auto &e : res.constraints)
     collector.visit(e);
 
-  ArrayCache arrayCache; // default ctor
   for (auto &kv : order) {
     const Array *orig = kv.first;
     unsigned pos = kv.second;
@@ -245,16 +342,12 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
     e = subst.visit(e);
 
   for (auto &e : res.constraints)
-    e = klee::canonicalizeExprTree(e);
+    e = canonicalizeExprTree(e);
 
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   return res;
 }
-
-///===----------------------------------------------------------------------===
-/// Serialization & key computation
-///===----------------------------------------------------------------------===///
 
 std::string serializeCanonicalConstraints(
     const std::vector<ref<Expr>> &canonConstraints) {
@@ -271,17 +364,19 @@ std::string serializeCanonicalConstraints(
 
 std::string computeCanonicalKey(
     const std::vector<ref<Expr>> &canonConstraints) {
-  std::string buf =
-      klee::serializeCanonicalConstraints(canonConstraints);
+  std::string buf = serializeCanonicalConstraints(canonConstraints);
 
   llvm::SHA1 hash;
   hash.update(buf);
   auto digest = hash.final();
 
   std::string hex;
-  llvm::raw_string_ostream os(hex);
-  for (auto b : digest)
-    os.write_hex(static_cast<unsigned char>(b));
-  os.flush();
+  hex.reserve(digest.size() * 2);
+  for (uint8_t b : digest) {
+    hex.push_back("0123456789abcdef"[b >> 4]);
+    hex.push_back("0123456789abcdef"[b & 0xf]);
+  }
   return hex;
 }
+
+} // namespace klee

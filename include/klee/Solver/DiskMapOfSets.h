@@ -43,7 +43,7 @@ private:
   struct Chunk {
     uint64_t offset;
     uint32_t size;
-    NodeChunk* parsed;
+    std::unique_ptr<NodeChunk> parsed;
   };
   std::unordered_map<uint32_t, Chunk> chunk_cache_; // chunk_id -> Chunk
   size_t max_cache_size_ = 100; // chunks
@@ -60,12 +60,12 @@ private:
                                         std::set<std::string>::const_iterator q_begin,
                                         std::set<std::string>::const_iterator q_end);
   
-  void find_subsets(uint32_t node_id, std::set<std::string> accum,
+  void find_subsets(uint32_t node_id, std::set<std::string> &accum,
                     std::set<std::string>::const_iterator q_begin,
                     std::set<std::string>::const_iterator q_end,
                     std::vector<Entry>& results);
   
-  void find_supersets(uint32_t node_id, std::set<std::string> accum,
+  void find_supersets(uint32_t node_id, std::set<std::string> &accum,
                       std::set<std::string>::const_iterator q_begin,
                       std::set<std::string>::const_iterator q_end,
                       std::vector<Entry>& results);

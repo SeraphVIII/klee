@@ -6,6 +6,8 @@
 #include "DiskMapOfSets.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
+#include "klee/Expr/ExprBuilder.h"
+#include "klee/Expr/ArrayCache.h"
 
 #include <memory>
 #include <unordered_map>
@@ -50,6 +52,8 @@ public:
 private:
   mapofsets::DiskMapOfSets disk_;
   const std::vector<Assignment *> &assignmentTable_;
+  std::unique_ptr<ExprBuilder> builder_;
+  mutable ArrayCache arrayCache_;
 
   /// Canonicalize a constraint expression into a stable string key.
   std::string canonConstraint(ref<Expr> e) const;
@@ -64,7 +68,8 @@ private:
   /// Helper: pick *one* entry out of the vector<DiskMapOfSets::Entry>
   /// and convert its value to an Assignment*.
   bool pickEntry(const std::vector<mapofsets::DiskMapOfSets::Entry> &entries,
-                 Assignment *&outAssignment);
+                const std::set<ref<Expr>> &originalConstraints,
+                Assignment *&outAssignment);
 };
 
 } // namespace klee

@@ -203,29 +203,14 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
   }
 
   if (diskCexCache_) {
-    if (CexCacheTryAll) {
-      Assignment *diskResult = nullptr;
-      if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
-        result = diskResult;
-        return true;
-      }
-      if (!diskResult && diskCexCache_->findSubset(key, diskResult)) {
-        result = diskResult;
-        return true;
-      }
-    } else {
-      Assignment *diskResult = nullptr;
-      if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
-        result = diskResult;
-        return true;
-      }
-      if (!diskResult) {
-        diskCexCache_->findSubset(key, diskResult);
-        if (diskResult) {
-          result = diskResult;
-          return true;
-        }
-      }
+    Assignment *diskResult = nullptr;
+    if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
+      result = diskResult;
+      return true;
+    }
+    if (!diskResult && diskCexCache_->findSubset(key, diskResult)) {
+      result = diskResult;
+      return true;
     }
   }
 

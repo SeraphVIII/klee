@@ -8,21 +8,19 @@
 using namespace klee::mapofsets;
 
 DiskMapOfSets::DiskMapOfSets(const std::string &filename) {
-  klee_message("ENTER DiskMapOfSets('%s')\n", filename.c_str());
-
   fd_ = open(filename.c_str(), O_RDONLY);
-  klee_message("open() returned fd=%d\n", fd_);
-  assert(fd_ >= 0);
+  if (fd_ < 0)
+    klee_error("DiskMapOfSets: cannot open '%s'", filename.c_str());
 
   struct stat st;
   fstat(fd_, &st);
   file_size_ = st.st_size;
-  klee_message("file_size=%zu\n", file_size_);
-  assert(file_size_ > 0);
+  if (file_size_ == 0)
+    klee_error("DiskMapOfSets: file '%s' is empty", filename.c_str());
 
   mmap_base_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0);
-  klee_message("mmap_base=%p\n", mmap_base_);
-  assert(mmap_base_ != MAP_FAILED);
+  if (mmap_base_ == MAP_FAILED)
+    klee_error("DiskMapOfSets: mmap failed for '%s'", filename.c_str());
 
   // -------------------------------------------------------------------------
   // On-disk layout written by MapOfSetsDiskBuilder::build():
@@ -91,7 +89,7 @@ DiskMapOfSets::~DiskMapOfSets() {
 NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   auto it = chunk_cache_.find(chunk_id);
   if (it != chunk_cache_.end())
-    return it->second.parsed;
+    return it->second.parsed.get();
 
   if (chunk_cache_.size() >= max_cache_size_) {
     // Simple LRU: erase first
@@ -128,18 +126,17 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
                  file_size_, (uint64_t)file_size_ - chunk.offset);
     abort();
   }
-  chunk.parsed = new NodeChunk();
+  chunk.parsed = std::make_unique<NodeChunk>();
   google::protobuf::io::ArrayInputStream chunk_stream(
       static_cast<const char *>(mmap_base_) + chunk.offset, chunk.size);
 
   if (!chunk.parsed->ParseFromZeroCopyStream(&chunk_stream)) {
-    klee_message("DiskMapOfSets: failed to parse chunk %u at off=%llu size=%u\n",
-                 chunk_id, (unsigned long long)chunk.offset, chunk.size);
-    abort();
+    klee_error("DiskMapOfSets: failed to parse chunk %u", chunk_id);
   }
 
+  NodeChunk *raw = chunk.parsed.get();
   chunk_cache_[chunk_id] = std::move(chunk);
-  return chunk_cache_[chunk_id].parsed;
+  return raw;
 }
 
 const Node &DiskMapOfSets::get_node(uint32_t node_id) {
@@ -208,28 +205,25 @@ std::optional<std::string> DiskMapOfSets::lookup_rec(
   return lookup_rec(it->child_id(), std::next(q_begin), q_end);
 }
 
-std::vector<klee::mapofsets::DiskMapOfSets::Entry>
+std::vector<DiskMapOfSets::Entry>
 DiskMapOfSets::subsets(const std::set<std::string> &query_set) {
-  std::vector<klee::mapofsets::DiskMapOfSets::Entry> results;
+  std::vector<Entry> results;
   std::set<std::string> accum;
-  klee_message("Start subsets\n");
-  find_subsets(header_file_.header().root_id(), accum, query_set.begin(),
-               query_set.end(), results);
-  klee_message("End subsets\n");
+  find_subsets(header_file_.header().root_id(), accum,
+               query_set.begin(), query_set.end(), results);
   return results;
 }
 
 void DiskMapOfSets::find_subsets(
-    uint32_t node_id, std::set<std::string> accum,
+    uint32_t node_id, std::set<std::string> &accum,
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
-    std::vector<klee::mapofsets::DiskMapOfSets::Entry> &results) {
+    std::vector<Entry> &results) {
   const auto &node = get_node(node_id);
+
   if (node.is_end_of_set()) {
     std::string v = read_value(node.value_offset());
-    if (v.rfind("UNSAT", 0) == 0) {
-      results.push_back(Entry{accum, std::move(v)});
-    }
+    results.push_back(Entry{accum, std::move(v)});
   }
 
   for (auto q_it = q_begin; q_it != q_end; ++q_it) {
@@ -244,70 +238,58 @@ void DiskMapOfSets::find_subsets(
 
     if (child_it != node2.children().end() &&
         deserialize_key(child_it->key()) == elt) {
-      auto child_accum = accum;      // copy
-      child_accum.insert(elt);
-      find_subsets(child_it->child_id(), std::move(child_accum),
-                  std::next(q_it), q_end, results);
+      accum.insert(elt);
+      find_subsets(child_it->child_id(), accum,
+                   std::next(q_it), q_end, results);
+      accum.erase(elt); // backtrack
     }
   }
 }
 
-std::vector<klee::mapofsets::DiskMapOfSets::Entry>
+std::vector<DiskMapOfSets::Entry>
 DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
-  std::vector<klee::mapofsets::DiskMapOfSets::Entry> results;
+  std::vector<Entry> results;
   std::set<std::string> accum;
-  klee_message("Start supersets\n");
-  find_supersets(header_file_.header().root_id(), std::move(accum),
+  find_supersets(header_file_.header().root_id(), accum,
                  query_set.begin(), query_set.end(), results);
-  klee_message("End supersets\n");
   return results;
 }
 
 void DiskMapOfSets::find_supersets(
-    uint32_t node_id, std::set<std::string> accum,
+    uint32_t node_id, std::set<std::string> &accum,
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
-    std::vector<klee::mapofsets::DiskMapOfSets::Entry> &results) {
+    std::vector<Entry> &results) {
   const auto &node = get_node(node_id);
 
   if (q_begin == q_end) {
-    // All query elements matched; any end-of-set here or deeper is a superset
-    if (node.is_end_of_set()) {
-      klee::mapofsets::DiskMapOfSets::Entry e{accum,
-                                             read_value(node.value_offset())};
-      results.push_back(e);
-    }
-    // Continue into all children (adding extra elements makes bigger supersets)
+    if (node.is_end_of_set())
+      results.push_back(Entry{accum, read_value(node.value_offset())});
+
     for (const auto &child : node.children()) {
-      accum.insert(deserialize_key(child.key()));
-      find_supersets(child.child_id(), accum, q_begin, q_end,
-                     results);
-      accum.erase(std::prev(accum.end())); // backtrack
+      const std::string child_key = deserialize_key(child.key());
+      accum.insert(child_key);
+      find_supersets(child.child_id(), accum, q_begin, q_end, results);
+      accum.erase(child_key);  // erase by key, not by position
     }
   } else {
-    // Still need to match remaining query elements
     const std::string &elt = *q_begin;
     auto next_q = std::next(q_begin);
 
-    // Scan all children in order (they're sorted)
     for (const auto &child : node.children()) {
       const std::string child_key = deserialize_key(child.key());
       accum.insert(child_key);
 
       if (child_key == elt) {
-        // Exact match: recurse with next query element
-        find_supersets(child.child_id(), accum, next_q, q_end,
-                       results);
+        find_supersets(child.child_id(), accum, next_q, q_end, results);
       } else if (child_key < elt) {
-        // Extra element before required elt: recurse still needing elt
-        find_supersets(child.child_id(), accum, q_begin, q_end,
-                       results);
+        find_supersets(child.child_id(), accum, q_begin, q_end, results);
       } else {
-        // child_key > elt: cannot match elt in this subtree, skip rest
+        accum.erase(child_key);  // must erase before break
         break;
       }
 
-      accum.erase(std::prev(accum.end())); // backtrack
+      accum.erase(child_key);  // erase by key, not by position
     }
   }
 }

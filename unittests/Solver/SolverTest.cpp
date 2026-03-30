@@ -169,131 +169,235 @@ TEST(SolverTest, Evaluation) {
   testOpcode<SgeExpr>(*solver);
 }
 
-
-// Add this test case at the end, before the closing brace:
 TEST(DiskMapOfSetsTest, RoundTrip) {
-  // 1. Build in-memory MapOfSets
-  klee::MapOfSets<std::string,std::string> mem;
+  klee::MapOfSets<std::string, std::string> mem;
   mem.insert({"a"}, "UNSAT");
-  mem.insert({"a","b"}, "SAT:1");
-  mem.insert({"a","c"}, "SAT:2");
+  mem.insert({"a", "b"}, "SAT:1");
+  mem.insert({"a", "c"}, "SAT:2");
   mem.insert({"x"}, "SAT:42");
 
-  // 2. Serialize to disk
   const std::string testFile = "test_disk_cache.mapo";
   klee::MapOfSetsDiskBuilder::build(mem, testFile);
-
-  // 3. Load from disk
   klee::mapofsets::DiskMapOfSets disk(testFile);
 
-  // 4. Test exact lookup
+  // Exact lookup
   {
     auto exact = disk.lookup({"a"});
     ASSERT_TRUE(exact.has_value());
     EXPECT_EQ("UNSAT", *exact);
   }
 
-  // 5. Test supersets({"a"})
+  // supersets({"a"}) → {"a"}, {"a","b"}, {"a","c"} — not {"x"}
   {
     auto supers = disk.supersets({"a"});
-    ASSERT_EQ(3, supers.size());  // {"a"}, {"a","b"}, {"a","c"}
-    std::set<std::string> foundValues;
-    for (const auto& e : supers) {
-      foundValues.insert(e.value);
-      if (e.key_set == std::set<std::string>{"a"})
-        EXPECT_EQ("UNSAT", e.value);
-    }
-    EXPECT_NE(foundValues.find("SAT:1"), foundValues.end());
-    EXPECT_NE(foundValues.find("SAT:2"), foundValues.end());
+    ASSERT_EQ(3u, supers.size());
+    std::set<std::string> values;
+    for (const auto &e : supers)
+      values.insert(e.value);
+    EXPECT_TRUE(values.count("UNSAT"));
+    EXPECT_TRUE(values.count("SAT:1"));
+    EXPECT_TRUE(values.count("SAT:2"));
+    EXPECT_FALSE(values.count("SAT:42")); // {"x"} is not a superset of {"a"}
   }
 
-  // 6. Test subsets({"a","b","c"})
+  // subsets({"a","b","c"}) → {"a"}, {"a","b"}, {"a","c"}
+  // Under new code find_subsets returns ALL entries (SAT and UNSAT).
   {
-    auto subs = disk.subsets({"a","b","c"});
-    ASSERT_EQ(1, subs.size());
-    EXPECT_EQ("UNSAT", subs[0].value);
-    EXPECT_EQ(std::set<std::string>{"a"}, subs[0].key_set);
+    auto subs = disk.subsets({"a", "b", "c"});
+    ASSERT_EQ(3u, subs.size());
+    std::set<std::set<std::string>> gotKeys;
+    std::set<std::string> gotValues;
+    for (const auto &e : subs) {
+      gotKeys.insert(e.key_set);
+      gotValues.insert(e.value);
+    }
+    EXPECT_TRUE(gotKeys.count({"a"}));
+    EXPECT_TRUE(gotKeys.count({"a", "b"}));
+    EXPECT_TRUE(gotKeys.count({"a", "c"}));
+    EXPECT_TRUE(gotValues.count("UNSAT"));
+    EXPECT_TRUE(gotValues.count("SAT:1"));
+    EXPECT_TRUE(gotValues.count("SAT:2"));
   }
 
-  // 7. Test empty/miss
+  // Miss
   {
     auto miss = disk.lookup({"missing"});
     EXPECT_FALSE(miss.has_value());
   }
 
-  printf("✅ DiskMapOfSets roundtrip PASSED\n");
+  // subsets of a key not in the map returns only what is actually a subset
+  {
+    auto subs = disk.subsets({"x", "y"});
+    ASSERT_EQ(1u, subs.size()); // only {"x"} -> "SAT:42"
+    EXPECT_EQ(std::set<std::string>{"x"}, subs[0].key_set);
+    EXPECT_EQ("SAT:42", subs[0].value);
+  }
+
+  std::remove(testFile.c_str());
 }
 
-// Updated test with correct semantics (subsets = UNSAT only)
 TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
-  klee::MapOfSets<std::string,std::string> mem;
-
-  // UNSAT prefixes (subsets hits)
-  mem.insert({}, "UNSAT_root");            // Empty set = UNSAT
-  mem.insert({"a"}, "UNSAT_a");            // Prefix = UNSAT
-  mem.insert({"a", "b"}, "UNSAT_ab");      // Deeper UNSAT
-
-  // SAT leaves (exact/supersets hits)
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({}, "UNSAT_root");
+  mem.insert({"a"}, "UNSAT_a");
+  mem.insert({"a", "b"}, "UNSAT_ab");
   mem.insert({"a", "b", "c"}, "SAT_abc");
   mem.insert({"x"}, "SAT_x");
   mem.insert({"x", "y"}, "SAT_xy");
 
   const std::string testFile = "complex_disk_cache.mapo";
   klee::MapOfSetsDiskBuilder::build(mem, testFile);
-
   klee::mapofsets::DiskMapOfSets disk(testFile);
 
-  // Exact lookups (UNSAT + SAT)
+  // Exact lookups
   EXPECT_EQ("UNSAT_root", *disk.lookup({}));
-  EXPECT_EQ("UNSAT_a", *disk.lookup({"a"}));
-  EXPECT_EQ("UNSAT_ab", *disk.lookup({"a","b"}));
-  EXPECT_EQ("SAT_abc", *disk.lookup({"a","b","c"}));
-  EXPECT_EQ("SAT_x", *disk.lookup({"x"}));
+  EXPECT_EQ("UNSAT_a",    *disk.lookup({"a"}));
+  EXPECT_EQ("UNSAT_ab",   *disk.lookup({"a", "b"}));
+  EXPECT_EQ("SAT_abc",    *disk.lookup({"a", "b", "c"}));
+  EXPECT_EQ("SAT_x",      *disk.lookup({"x"}));
+  EXPECT_EQ("SAT_xy",     *disk.lookup({"x", "y"}));
 
-  // supersets({"a"}) → ALL cached supersets (UNSAT + SAT)
+  // supersets({"a"}) → {"a"}, {"a","b"}, {"a","b","c"} — not {}
   {
     auto supers = disk.supersets({"a"});
-    ASSERT_EQ(3u, supers.size());  // {}, isn't a superset of {"a"}
+    ASSERT_EQ(3u, supers.size());
     std::set<std::string> values;
-    for (const auto& e : supers) values.insert(e.value);
-
+    for (const auto &e : supers)
+      values.insert(e.value);
     EXPECT_TRUE(values.count("UNSAT_a"));
     EXPECT_TRUE(values.count("UNSAT_ab"));
     EXPECT_TRUE(values.count("SAT_abc"));
+    EXPECT_FALSE(values.count("UNSAT_root")); // {} is not a superset of {"a"}
   }
 
-  // subsets({"a","b","c"}) → UNSAT subsets only
+  // subsets({"a","b","c"}) → {}, {"a"}, {"a","b"}, {"a","b","c"}
+  // find_subsets now returns ALL entries including SAT.
+  // The set itself is also a subset of itself.
   {
     auto subs = disk.subsets({"a", "b", "c"});
-    ASSERT_EQ(3u, subs.size());  // {}, {"a"}, {"a","b"}
-
-    // Compare returned key_sets exactly
-    std::set<std::set<std::string>> got;
-    for (const auto& e : subs) {
-      EXPECT_TRUE(e.value.rfind("UNSAT", 0) == 0); // starts with "UNSAT"
-      got.insert(e.key_set);
+    ASSERT_EQ(4u, subs.size());
+    std::set<std::set<std::string>> gotKeys;
+    std::set<std::string> gotValues;
+    for (const auto &e : subs) {
+      gotKeys.insert(e.key_set);
+      gotValues.insert(e.value);
     }
-
-    EXPECT_TRUE(got.count(std::set<std::string>{}));
-    EXPECT_TRUE(got.count(std::set<std::string>{"a"}));
-    EXPECT_TRUE(got.count(std::set<std::string>{"a","b"}));
+    EXPECT_TRUE(gotKeys.count({}));
+    EXPECT_TRUE(gotKeys.count({"a"}));
+    EXPECT_TRUE(gotKeys.count({"a", "b"}));
+    EXPECT_TRUE(gotKeys.count({"a", "b", "c"}));
+    // Mix of UNSAT and SAT
+    EXPECT_TRUE(gotValues.count("UNSAT_root"));
+    EXPECT_TRUE(gotValues.count("UNSAT_a"));
+    EXPECT_TRUE(gotValues.count("UNSAT_ab"));
+    EXPECT_TRUE(gotValues.count("SAT_abc"));
   }
 
-  // subsets({"x","y"}) → UNSAT subsets (none)
+  // subsets({"x","y"}) → {}, {"x"}, {"x","y"} — all subsets including SAT
   {
     auto subs = disk.subsets({"x", "y"});
-    ASSERT_EQ(1u, subs.size());
-    EXPECT_TRUE(subs[0].key_set.empty());
-    EXPECT_TRUE(subs[0].value.rfind("UNSAT", 0) == 0);
+    ASSERT_EQ(3u, subs.size());
+    std::set<std::set<std::string>> gotKeys;
+    for (const auto &e : subs)
+      gotKeys.insert(e.key_set);
+    EXPECT_TRUE(gotKeys.count({}));
+    EXPECT_TRUE(gotKeys.count({"x"}));
+    EXPECT_TRUE(gotKeys.count({"x", "y"}));
   }
 
-  unlink(testFile.c_str());
+  // supersets({}) → everything in the map
+  {
+    auto supers = disk.supersets({});
+    EXPECT_EQ(6u, supers.size());
+  }
+
+  // subsets of a key with no entry in the map returns only proper subsets
+  {
+    auto subs = disk.subsets({"a", "z"});
+    // Only {} and {"a"} are subsets — {"a","z"} not in map, {"z"} not in map
+    ASSERT_EQ(2u, subs.size());
+    std::set<std::set<std::string>> gotKeys;
+    for (const auto &e : subs)
+      gotKeys.insert(e.key_set);
+    EXPECT_TRUE(gotKeys.count({}));
+    EXPECT_TRUE(gotKeys.count({"a"}));
+  }
+
+  // Miss
+  {
+    EXPECT_FALSE(disk.lookup({"missing"}).has_value());
+    EXPECT_FALSE(disk.lookup({"a", "b", "c", "d"}).has_value());
+  }
+
+  std::remove(testFile.c_str());
 }
 
-// Cleanup test file (optional)
-TEST(DiskMapOfSetsTest, Cleanup) {
-  std::remove("test_disk_cache.mapo");
+TEST(DiskMapOfSetsTest, SupersetBacktracking) {
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({"b", "c"}, "SAT_bc");
+  mem.insert({"c"},       "SAT_c");
+  mem.insert({"c", "d"}, "SAT_cd");
+
+  const std::string testFile = "backtrack_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+  klee::mapofsets::DiskMapOfSets disk(testFile);
+
+  // supersets({"c"}) must find {"b","c"}, {"c"}, and {"c","d"} — all three
+  // contain "c", so all are valid supersets.
+  {
+    auto supers = disk.supersets({"c"});
+    ASSERT_EQ(3u, supers.size());
+    std::set<std::string> values;
+    for (const auto &e : supers)
+      values.insert(e.value);
+    EXPECT_TRUE(values.count("SAT_bc"));
+    EXPECT_TRUE(values.count("SAT_c"));
+    EXPECT_TRUE(values.count("SAT_cd"));
+  }
+
+  // Every returned key_set must contain "c" — this is what actually
+  // exercises the backtracking correctness: accum must not be corrupted
+  // when "b" is inserted and erased before we find "c".
+  {
+    auto supers = disk.supersets({"c"});
+    for (const auto &e : supers)
+      EXPECT_TRUE(e.key_set.count("c"))
+          << "key_set missing 'c': accum was corrupted by backtracking";
+  }
+
+  // Sanity: {"b"} alone is not in the map and {"b"} is not a superset of {"c"}
+  EXPECT_FALSE(disk.lookup({"b"}).has_value());
+
+  std::remove(testFile.c_str());
 }
 
+// Empty set edge cases
+TEST(DiskMapOfSetsTest, EmptySetEdgeCases) {
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({}, "UNSAT_empty");
+  mem.insert({"a"}, "SAT_a");
+
+  const std::string testFile = "empty_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+  klee::mapofsets::DiskMapOfSets disk(testFile);
+
+  // Exact lookup of empty set
+  EXPECT_EQ("UNSAT_empty", *disk.lookup({}));
+
+  // subsets({}) → only the empty set itself
+  {
+    auto subs = disk.subsets({});
+    ASSERT_EQ(1u, subs.size());
+    EXPECT_TRUE(subs[0].key_set.empty());
+  }
+
+  // supersets({}) → everything
+  {
+    auto supers = disk.supersets({});
+    ASSERT_EQ(2u, supers.size());
+  }
+
+  std::remove(testFile.c_str());
+}
 
 }
