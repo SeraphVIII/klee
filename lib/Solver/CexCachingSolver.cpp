@@ -39,12 +39,6 @@ cl::opt<std::string> DiskCexCacheFile(
     cl::init(""),
     cl::cat(SolvingCat));
 
-cl::opt<unsigned> DiskCexCacheAssignmentTableSize(
-    "disk-cex-assignment-table-size",
-    cl::desc("Size of assignment table for disk cache"),
-    cl::init(10000),
-    cl::cat(SolvingCat));
-
 cl::opt<bool> DebugCexCacheCheckBinding(
     "debug-cex-cache-check-binding", cl::init(false),
     cl::desc("Debug the correctness of the counterexample "
@@ -87,7 +81,6 @@ class CexCachingSolver : public SolverImpl {
 
   // Disk cache support
   std::unique_ptr<DiskCexCache> diskCexCache_;
-  std::vector<Assignment*> diskAssignmentTable_;
 
   bool searchForAssignment(KeyType &key, 
                            Assignment *&result);
@@ -294,12 +287,8 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     : solver(std::move(solver)) {
   // Initialize disk cache if enabled
-  if (!DiskCexCacheFile.empty()) {
-    diskAssignmentTable_.resize(DiskCexCacheAssignmentTableSize);
-    diskCexCache_ = std::make_unique<DiskCexCache>(
-        DiskCexCacheFile.getValue(),
-        diskAssignmentTable_);
-  }
+  if (!DiskCexCacheFile.empty())
+    diskCexCache_ = std::make_unique<DiskCexCache>(DiskCexCacheFile.getValue());
 }
 
 
@@ -309,8 +298,6 @@ CexCachingSolver::~CexCachingSolver() {
          ie = assignmentsTable.end(); it != ie; ++it)
     delete *it;
 
-  for (auto a : diskAssignmentTable_)
-    if (a) delete a;
 }
 
 bool CexCachingSolver::computeValidity(const Query& query,

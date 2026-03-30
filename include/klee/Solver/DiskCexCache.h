@@ -4,44 +4,46 @@
 #define DISK_CEX_CACHE_H
 
 #include "DiskMapOfSets.h"
+#include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
 #include "klee/Expr/ExprBuilder.h"
 #include "klee/Expr/ArrayCache.h"
 
+#include <map>
 #include <memory>
-#include <unordered_map>
-#include <string>
 #include <set>
+#include <string>
+#include <vector>
 
 namespace klee {
 
-/// Simple interface for a read-only CEX cache backed by DiskMapOfSets.
-/// This is *not* trying to be the full CexCachingSolver, just a helper.
+/// Read-only CEX cache backed by DiskMapOfSets.
+///
+/// Values on disk use one of two formats:
+///   "UNSAT"                          — unsatisfiable sentinel
+///   "SAT_DATA:<name>=<hex>;<name>=<hex>;..."
+///                                    — concrete assignment, one entry per
+///                                      canonical array (A0, A1, ...), hex
+///                                      encoding of byte values
+///
+/// Keys are produced by canonicalizeConstraintSet() followed by
+/// ExprPPrinter::printSingleExpr() (no trailing newline) for each constraint.
 class DiskCexCache {
 public:
-  /// How values are encoded on disk right now
-  enum class ValueKind {
-    Unsat,          ///< represents an UNSAT sentinel
-    AssignmentId,   ///< represents a SAT assignment with an ID
-    Unknown         ///< parse failure, treat as miss
-  };
+  /// Serialize a SAT assignment to the "SAT_DATA:..." disk format.
+  /// forwardArrayMap maps original Array* -> canonical Array* (A0, A1, ...).
+  /// This is the inverse of what is needed for reading; it is exposed here
+  /// so that the future write path in CexCachingSolver can call it directly.
+  static std::string
+  serializeAssignment(const Assignment *a,
+                      const std::map<const Array *, const Array *> &forwardArrayMap);
 
-  struct ParsedValue {
-    ValueKind kind;
-    unsigned assignmentId; // valid iff kind == AssignmentId
-  };
-
-public:
-  /// Construct from an existing disk file and an assignment table.
-  /// assignmentTable maps IDs -> Assignment*. ID 0 is reserved for UNSAT.
-  DiskCexCache(const std::string &filename,
-               const std::vector<Assignment *> &assignmentTable);
+  /// Open a disk cache file for reading.
+  explicit DiskCexCache(const std::string &filename);
 
   /// Try to find a cached SAT assignment for a superset of `constraints`.
-  /// Returns true on cache hit; outAssignment is:
-  ///   - non-nullptr for SAT,
-  ///   - nullptr for UNSAT sentinel.
+  /// Returns true on hit; outAssignment is non-nullptr for SAT, nullptr for UNSAT.
   bool findSuperset(const std::set<ref<Expr>> &constraints,
                     Assignment *&outAssignment);
 
@@ -51,26 +53,42 @@ public:
 
 private:
   mapofsets::DiskMapOfSets disk_;
-  const std::vector<Assignment *> &assignmentTable_;
   std::unique_ptr<ExprBuilder> builder_;
   mutable ArrayCache arrayCache_;
+  /// Owns Assignment objects reconstructed from disk. Raw pointers returned
+  /// by findSuperset/findSubset remain valid for the lifetime of this object.
+  std::vector<std::unique_ptr<Assignment>> ownedAssignments_;
 
-  /// Convert a set<ref<Expr>> to a set<string> disk key using full
-  /// cross-constraint canonicalization (array alpha-renaming + expr tree
-  /// normalization). The string format is ExprPPrinter output with no
-  /// trailing newline, so it is unambiguous and matches what a write path
-  /// would produce.
-  std::set<std::string>
-  buildDiskKey(const std::set<ref<Expr>> &constraints) const;
+  enum class ValueKind {
+    Unsat,        ///< "UNSAT" sentinel
+    AssignmentData, ///< "SAT_DATA:..." with inline byte data
+    Unknown       ///< unrecognised format, treat as miss
+  };
 
-  /// Parse the disk value string into a ParsedValue.
+  struct ParsedValue {
+    ValueKind kind;
+    std::string satData; // valid iff kind == AssignmentData
+  };
+
+  /// Canonicalize constraints and return both the disk key set and the full
+  /// CanonicalizationResult (which carries the inverse array map needed to
+  /// reconstruct assignments on a cache hit).
+  std::pair<std::set<std::string>, CanonicalizationResult>
+  buildDiskKeyAndCanon(const std::set<ref<Expr>> &constraints) const;
+
   ParsedValue parseValue(const std::string &val) const;
 
-  /// Helper: pick *one* entry out of the vector<DiskMapOfSets::Entry>
-  /// and convert its value to an Assignment*.
+  /// Deserialize a "SAT_DATA:..." string into an Assignment whose bindings
+  /// reference the original (pre-canonicalization) arrays from `canon`.
+  /// Returns nullptr on parse failure. The returned pointer is owned by
+  /// ownedAssignments_ and remains valid for the lifetime of this object.
+  Assignment *parseAssignmentData(const std::string &data,
+                                  const CanonicalizationResult &canon);
+
   bool pickEntry(const std::vector<mapofsets::DiskMapOfSets::Entry> &entries,
-                const std::set<ref<Expr>> &originalConstraints,
-                Assignment *&outAssignment);
+                 const CanonicalizationResult &canon,
+                 const std::set<ref<Expr>> &originalConstraints,
+                 Assignment *&outAssignment);
 };
 
 } // namespace klee

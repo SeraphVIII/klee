@@ -8,6 +8,10 @@
 #===------------------------------------------------------------------------===#
 find_package(Protobuf REQUIRED)
 
+# Generate mapofsets.pb.h and mapofsets.pb.cc into the build directory.
+# PROTO_HDRS / PROTO_SRCS are absolute paths under CMAKE_CURRENT_BINARY_DIR.
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS mapofsets.proto)
+
 add_library(kleaverSolver
   AssignmentValidatingSolver.cpp
   CachingSolver.cpp
@@ -36,7 +40,7 @@ add_library(kleaverSolver
   ValidatingSolver.cpp
   Z3Builder.cpp
   Z3Solver.cpp
-  mapofsets.pb.cc
+  ${PROTO_SRCS}
 )
 
 llvm_config(kleaverSolver "${USE_LLVM_SHARED}" support)
@@ -46,8 +50,13 @@ target_link_libraries(kleaverSolver PRIVATE
   kleeSupport
   ${KLEE_SOLVER_LIBRARIES}
   protobuf::libprotobuf)
-target_include_directories(kleaverSolver PRIVATE ${KLEE_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${KLEE_SOLVER_INCLUDE_DIRS})
+
+# CMAKE_CURRENT_BINARY_DIR is where the generated pb.h lands.
+# PUBLIC so that targets linking kleaverSolver (e.g. SolverTest) can include
+# "mapofsets.pb.h" via DiskMapOfSets.h without listing the build dir themselves.
+target_include_directories(kleaverSolver
+  PUBLIC  ${CMAKE_CURRENT_BINARY_DIR}
+  PRIVATE ${KLEE_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${KLEE_SOLVER_INCLUDE_DIRS})
+
 target_compile_options(kleaverSolver PRIVATE ${KLEE_COMPONENT_CXX_FLAGS})
 target_compile_definitions(kleaverSolver PRIVATE ${KLEE_COMPONENT_CXX_DEFINES})
-
-

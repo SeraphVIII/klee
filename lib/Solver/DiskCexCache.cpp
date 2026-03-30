@@ -5,26 +5,66 @@
 
 #include "klee/Expr/ExprPPrinter.h"
 
-#include <sstream>
+#include "llvm/Support/raw_ostream.h"
 
 using namespace klee;
 using mapofsets::DiskMapOfSets;
 
-DiskCexCache::DiskCexCache(const std::string &filename,
-                           const std::vector<Assignment *> &assignmentTable)
-    : disk_(filename), assignmentTable_(assignmentTable), builder_(createDefaultExprBuilder()) {}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-std::set<std::string>
-DiskCexCache::buildDiskKey(const std::set<ref<Expr>> &constraints) const {
-  // Canonicalize as a set so array positions (A0, A1, ...) are assigned
-  // consistently across all constraints, not independently per expression.
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+DiskCexCache::DiskCexCache(const std::string &filename)
+    : disk_(filename), builder_(createDefaultExprBuilder()) {}
+
+// ---------------------------------------------------------------------------
+// Serialization (public static — used by the write path and tests)
+// ---------------------------------------------------------------------------
+
+std::string DiskCexCache::serializeAssignment(
+    const Assignment *a,
+    const std::map<const Array *, const Array *> &forwardArrayMap) {
+  std::string out = "SAT_DATA:";
+  for (const auto &[orig, canon] : forwardArrayMap) {
+    out += canon->name;
+    out += '=';
+    auto it = a->bindings.find(orig);
+    if (it != a->bindings.end()) {
+      for (unsigned char b : it->second) {
+        out += "0123456789abcdef"[b >> 4];
+        out += "0123456789abcdef"[b & 0xf];
+      }
+    }
+    // An empty hex string is valid and decodes to an empty byte vector.
+    out += ';';
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Key construction
+// ---------------------------------------------------------------------------
+
+std::pair<std::set<std::string>, CanonicalizationResult>
+DiskCexCache::buildDiskKeyAndCanon(
+    const std::set<ref<Expr>> &constraints) const {
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
   CanonicalizationResult canon =
       klee::canonicalizeConstraintSet(vec, *builder_, arrayCache_);
 
-  // Serialize each canonicalized constraint to a string key. We use
-  // printSingleExpr directly (no trailing newline) so that the key format
-  // is unambiguous and matches what a future write path would produce.
+  // Serialize each canonicalized constraint to a string key using
+  // printSingleExpr with no trailing newline, for an unambiguous format.
   std::set<std::string> key;
   for (const auto &e : canon.constraints) {
     std::string s;
@@ -33,55 +73,97 @@ DiskCexCache::buildDiskKey(const std::set<ref<Expr>> &constraints) const {
     os.flush();
     key.insert(s);
   }
-  return key;
+  return {std::move(key), std::move(canon)};
 }
 
-// Current encoding: value is either
-//   "UNSAT"              -> Unsat
-//   "SAT:<id>"           -> AssignmentId(id)
-// You can change this later to a protobuf value.
+// ---------------------------------------------------------------------------
+// Value parsing
+// ---------------------------------------------------------------------------
+
 DiskCexCache::ParsedValue
 DiskCexCache::parseValue(const std::string &val) const {
-  ParsedValue pv{ValueKind::Unknown, 0};
-  if (val == "UNSAT") {
-    pv.kind = ValueKind::Unsat;
-    return pv;
-  }
-  const std::string prefix = "SAT:";
-  if (val.compare(0, prefix.size(), prefix) == 0) {
-    unsigned id = 0;
-    std::istringstream iss(val.substr(prefix.size()));
-    if ((iss >> id)) {
-      pv.kind = ValueKind::AssignmentId;
-      pv.assignmentId = id;
-      return pv;
-    }
-  }
-  return pv;
+  if (val == "UNSAT")
+    return {ValueKind::Unsat, ""};
+  if (val.size() > 9 && val.compare(0, 9, "SAT_DATA:") == 0)
+    return {ValueKind::AssignmentData, val};
+  return {ValueKind::Unknown, ""};
 }
 
+// ---------------------------------------------------------------------------
+// Assignment deserialization
+// ---------------------------------------------------------------------------
+
+Assignment *
+DiskCexCache::parseAssignmentData(const std::string &data,
+                                  const CanonicalizationResult &canon) {
+  // Build canonical_name -> original Array* from the forward map.
+  std::map<std::string, const Array *> nameToOrig;
+  for (const auto &[orig, can] : canon.forwardArrayMap)
+    nameToOrig[can->name] = orig;
+
+  // Parse "SAT_DATA:A0=deadbeef;A1=0102;" entry by entry.
+  std::vector<const Array *> objects;
+  std::vector<std::vector<unsigned char>> values;
+
+  size_t pos = 9; // skip "SAT_DATA:"
+  while (pos < data.size()) {
+    size_t eq = data.find('=', pos);
+    if (eq == std::string::npos)
+      break;
+    std::string name = data.substr(pos, eq - pos);
+
+    size_t semi = data.find(';', eq + 1);
+    if (semi == std::string::npos)
+      semi = data.size();
+    const std::string hexStr = data.substr(eq + 1, semi - eq - 1);
+
+    auto nameIt = nameToOrig.find(name);
+    if (nameIt != nameToOrig.end()) {
+      std::vector<unsigned char> bytes;
+      bytes.reserve(hexStr.size() / 2);
+      for (size_t i = 0; i + 1 < hexStr.size(); i += 2) {
+        int hi = hexNibble(hexStr[i]);
+        int lo = hexNibble(hexStr[i + 1]);
+        if (hi < 0 || lo < 0)
+          return nullptr; // malformed hex
+        bytes.push_back(static_cast<unsigned char>((hi << 4) | lo));
+      }
+      objects.push_back(nameIt->second);
+      values.push_back(std::move(bytes));
+    }
+    pos = semi + 1;
+  }
+
+  auto *a = new Assignment(objects, values);
+  ownedAssignments_.emplace_back(a);
+  return a;
+}
+
+// ---------------------------------------------------------------------------
+// Entry selection
+// ---------------------------------------------------------------------------
 
 bool DiskCexCache::pickEntry(
     const std::vector<DiskMapOfSets::Entry> &entries,
+    const CanonicalizationResult &canon,
     const std::set<ref<Expr>> &originalConstraints,
     Assignment *&outAssignment) {
   for (const auto &e : entries) {
     ParsedValue pv = parseValue(e.value);
     switch (pv.kind) {
     case ValueKind::Unsat:
-      // Any UNSAT subset proves the full set is UNSAT.
+      // Any UNSAT subset proves the full set UNSAT.
       outAssignment = nullptr;
       return true;
-    case ValueKind::AssignmentId:
-      if (pv.assignmentId < assignmentTable_.size()) {
-        Assignment *a = assignmentTable_[pv.assignmentId];
-        if (a && a->satisfies(originalConstraints.begin(),
-                              originalConstraints.end())) {
-          outAssignment = a;
-          return true;
-        }
+    case ValueKind::AssignmentData: {
+      Assignment *a = parseAssignmentData(pv.satData, canon);
+      if (a && a->satisfies(originalConstraints.begin(),
+                            originalConstraints.end())) {
+        outAssignment = a;
+        return true;
       }
       break;
+    }
     case ValueKind::Unknown:
     default:
       break;
@@ -90,16 +172,20 @@ bool DiskCexCache::pickEntry(
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Public interface
+// ---------------------------------------------------------------------------
+
 bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
                                 Assignment *&outAssignment) {
-  auto diskKey = buildDiskKey(constraints);
+  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
   auto supers = disk_.supersets(diskKey);
-  return pickEntry(supers, constraints, outAssignment);
+  return pickEntry(supers, canon, constraints, outAssignment);
 }
 
 bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
                               Assignment *&outAssignment) {
-  auto diskKey = buildDiskKey(constraints);
+  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
   auto subs = disk_.subsets(diskKey);
-  return pickEntry(subs, constraints, outAssignment);
+  return pickEntry(subs, canon, constraints, outAssignment);
 }

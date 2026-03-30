@@ -65,13 +65,24 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     abort();
   }
 
-  // Optional sanity checks (helps catch builder/reader mismatches early)
+  // Sanity-check directory and values regions.
   uint64_t dir_off = header_file_.header().directory_offset();
-  uint64_t dir_sz = header_file_.header().directory_size();
+  uint64_t dir_sz  = header_file_.header().directory_size();
   if (dir_off < 16ULL + header_size || dir_off + dir_sz > (uint64_t)file_size_) {
     klee_message("DiskMapOfSets: directory range invalid "
                  "(dir_off=%llu dir_sz=%llu file_size=%zu)\n",
                  (unsigned long long)dir_off, (unsigned long long)dir_sz,
+                 file_size_);
+    abort();
+  }
+
+  uint64_t val_off = header_file_.header().values_offset();
+  uint64_t val_sz  = header_file_.header().values_size();
+  if (val_sz > 0 &&
+      (val_off < 16ULL + header_size || val_off + val_sz > (uint64_t)file_size_)) {
+    klee_message("DiskMapOfSets: values region invalid "
+                 "(val_off=%llu val_sz=%llu file_size=%zu)\n",
+                 (unsigned long long)val_off, (unsigned long long)val_sz,
                  file_size_);
     abort();
   }
@@ -163,17 +174,20 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   if (offset == 0)
     return "";
 
-  const auto &vb = header_file_.values_blob();
-  uint64_t real = offset - 1;
+  uint64_t real     = offset - 1;
+  uint64_t val_off  = header_file_.header().values_offset();
+  uint64_t val_sz   = header_file_.header().values_size();
 
-  if (real + 4ULL > (uint64_t)vb.size())
+  if (real + 4ULL > val_sz)
     return "";
 
-  const char *blob = vb.data() + real;
+  // Read directly from the mmap'd file region — no heap allocation for the
+  // lookup itself, only for the returned string copy.
+  const char *blob = static_cast<const char *>(mmap_base_) + val_off + real;
   uint32_t len = 0;
-  memcpy(&len, blob, 4); // 4-byte length prefix
+  memcpy(&len, blob, 4); // 4-byte little-endian length prefix
 
-  if (real + 4ULL + (uint64_t)len > (uint64_t)vb.size())
+  if (real + 4ULL + (uint64_t)len > val_sz)
     return "";
 
   return std::string(blob + 4, len);

@@ -26,69 +26,69 @@ void MapOfSetsDiskBuilder::dfsAssign(const MapOfSetsDiskBuilder::UBTree::Node *s
 void MapOfSetsDiskBuilder::build(const UBTree &tree,
                                  const std::string &filename,
                                  uint32_t chunkSize) {
-  // 1. Extract nodes in a stable order (DFS assigns IDs)
+  // -------------------------------------------------------------------------
+  // On-disk layout:
+  //   [u64 magic][u64 header_size][Header proto bytes]
+  //   [directory: numChunks * 12 bytes]
+  //   [values blob]
+  //   [chunk protobufs...]
+  //
+  // All offsets recorded in Header are byte positions from the start of file.
+  // -------------------------------------------------------------------------
+  static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
+  const uint64_t kPreambleSize = 16; // magic + header_size
+
+  // 1. Extract nodes in stable DFS order.
   std::vector<BuildNode> nodes;
   nodes.reserve(1024);
-  const auto *root = &tree.root;
-  dfsAssign(root, nodes);
+  dfsAssign(&tree.root, nodes);
   uint32_t totalNodes = static_cast<uint32_t>(nodes.size());
 
   klee_message("BUILDER: %u nodes\n", totalNodes);
 
   // 2. Build values blob and record per-node offsets.
-  //    We store offset+1 so 0 can mean "no value" (proto convention).
+  //    Stored as offset+1 so 0 means "no value".
   std::string valuesBlob;
   std::vector<uint64_t> valueOffsets(totalNodes, 0);
   for (const auto &bn : nodes) {
     if (!bn.isEndOfSet)
       continue;
-
     uint64_t offset = valuesBlob.size();
     uint32_t len = static_cast<uint32_t>(bn.value.size());
-
     valuesBlob.append(reinterpret_cast<const char *>(&len), sizeof(len));
     valuesBlob.append(bn.value.data(), bn.value.size());
-
     valueOffsets[bn.id] = offset + 1;
   }
-  klee_message("BUILDER: valuesBlob=%zu bytes\n", valuesBlob.size());
+  klee_message("BUILDER: values blob=%zu bytes\n", valuesBlob.size());
 
-  // 3. Build the header protobuf (MapOfSetsFile)
+  // 3. Compute directory size (fixed regardless of header size).
+  uint32_t numChunks = (totalNodes + chunkSize - 1) / chunkSize;
+  uint64_t dirSize = numChunks * 12ULL; // uint64 offset + uint32 size per entry
+
+  // 4. Build the header protobuf. directory_offset and values_offset both
+  //    depend on the serialized header size, which depends on those fields
+  //    (varint encoding). Converge with a fixed-point loop.
   mapofsets::MapOfSetsFile file;
   mapofsets::Header *hdr = file.mutable_header();
-  hdr->set_magic(0x4d41504f53455453ULL); // "MAPOSETS" (also stored in raw preamble)
+  hdr->set_magic(0x4d41504f53455453ULL);
   hdr->set_version(1);
   hdr->set_root_id(0);
   hdr->set_total_nodes(totalNodes);
   hdr->set_chunk_size(chunkSize);
-  hdr->set_values_blob_size(valuesBlob.size());
-
-  // values_blob must be set before serializing the header protobuf
-  *file.mutable_values_blob() = std::move(valuesBlob);
-
-  // 4. Directory sizing
-  uint32_t numChunks = (totalNodes + chunkSize - 1) / chunkSize;
-  uint64_t dirSize = numChunks * 12ULL; // uint64 offset + uint32 size
   hdr->set_directory_size(dirSize);
+  hdr->set_values_size(valuesBlob.size());
 
-  // -------------------------------------------------------------------------
-  // On-disk layout:
-  //   [u64 magic][u64 header_size][header protobuf bytes][directory][chunks...]
-  // The reader parses ONLY the header protobuf region.
-  // -------------------------------------------------------------------------
-  static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
-  const uint64_t kPreambleSize = 16;
-
-  // directory_offset depends on the serialized header size, which itself can
-  // change when directory_offset changes (varint length). Compute fixed point.
   std::string finalHeaderBlob;
   uint64_t lastSize = 0;
-  for (int it = 0; it < 6; ++it) {
+  for (int iter = 0; iter < 8; ++iter) {
     std::string tmp;
     file.SerializeToString(&tmp);
     uint64_t sz = tmp.size();
 
-    hdr->set_directory_offset(kPreambleSize + sz);
+    uint64_t dirOffset  = kPreambleSize + sz;
+    uint64_t valOffset  = dirOffset + dirSize;
+    hdr->set_directory_offset(dirOffset);
+    hdr->set_values_offset(valOffset);
 
     if (sz == lastSize) {
       finalHeaderBlob = std::move(tmp);
@@ -98,13 +98,13 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     finalHeaderBlob = std::move(tmp);
   }
 
-  uint64_t headerSize = finalHeaderBlob.size();
-  uint64_t dirOffset = kPreambleSize + headerSize;
+  uint64_t headerSize  = finalHeaderBlob.size();
+  uint64_t dirOffset   = kPreambleSize + headerSize;
+  uint64_t valOffset   = dirOffset + dirSize;
+  uint64_t chunkStart  = valOffset + valuesBlob.size();
 
-  // 5. Build chunk protobufs
-  uint64_t chunkOffset = dirOffset + dirSize;
+  // 5. Build chunk protobufs.
   std::vector<std::string> chunkBuffers(numChunks);
-
   for (uint32_t c = 0; c < numChunks; ++c) {
     uint32_t first = c * chunkSize;
     uint32_t count = std::min(chunkSize, totalNodes - first);
@@ -116,10 +116,8 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     for (uint32_t i = 0; i < count; ++i) {
       const BuildNode &bn = nodes[first + i];
       mapofsets::Node *n = chunkMsg.add_nodes();
-
       n->set_is_end_of_set(bn.isEndOfSet);
       n->set_value_offset(valueOffsets[bn.id]);
-
       for (const auto &kv : bn.children) {
         mapofsets::Child *ch = n->add_children();
         ch->set_key(kv.first);
@@ -127,38 +125,38 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
       }
     }
 
-    std::string buf;
-    chunkMsg.SerializeToString(&buf);
-    chunkBuffers[c] = std::move(buf);
+    chunkMsg.SerializeToString(&chunkBuffers[c]);
   }
 
-  // 6. Write file
+  // 6. Write file.
   std::ofstream out(filename, std::ios::binary);
   if (!out) {
     klee_message("BUILDER: cannot create %s\n", filename.c_str());
     return;
   }
 
-  // Raw preamble: magic + header_size
+  // Preamble: raw magic + header_size
   out.write(reinterpret_cast<const char *>(&kRawMagic), sizeof(uint64_t));
   out.write(reinterpret_cast<const char *>(&headerSize), sizeof(uint64_t));
 
-  // Header protobuf (MapOfSetsFile)
+  // Header protobuf
   out.write(finalHeaderBlob.data(), finalHeaderBlob.size());
 
-  // Directory: entries are (u64 offset, u32 size) for each chunk
-  uint64_t curOffset = chunkOffset;
+  // Directory: (u64 offset, u32 size) per chunk
+  uint64_t curChunkOffset = chunkStart;
   for (const auto &buf : chunkBuffers) {
-    out.write(reinterpret_cast<const char *>(&curOffset), sizeof(uint64_t));
+    out.write(reinterpret_cast<const char *>(&curChunkOffset), sizeof(uint64_t));
     uint32_t sz = static_cast<uint32_t>(buf.size());
     out.write(reinterpret_cast<const char *>(&sz), sizeof(uint32_t));
-    curOffset += sz;
+    curChunkOffset += sz;
   }
+
+  // Values blob (raw bytes, accessed via mmap in the reader)
+  out.write(valuesBlob.data(), valuesBlob.size());
 
   // Chunk protobufs
-  for (const auto &buf : chunkBuffers) {
+  for (const auto &buf : chunkBuffers)
     out.write(buf.data(), buf.size());
-  }
 
-  klee_message("BUILDER: wrote %zu bytes OK\n", (size_t)curOffset);
+  klee_message("BUILDER: wrote %zu bytes OK\n", (size_t)curChunkOffset);
 }

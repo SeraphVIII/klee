@@ -12,12 +12,17 @@
 #include "klee/Expr/ArrayCache.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Solver/Solver.h"
-#include "klee/Solver/SolverCmdLine.h"
+#include "klee/Expr/ExprBuilder.h"
+#include "klee/Expr/ExprPPrinter.h"
+#include "klee/Solver/ConstraintCanonicalizer.h"
+#include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/DiskMapOfSets.h"
 #include "klee/Solver/MapOfSetsDiskBuilder.h"
+#include "klee/Solver/Solver.h"
+#include "klee/Solver/SolverCmdLine.h"
 
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
 
@@ -442,6 +447,116 @@ TEST(DiskMapOfSetsTest, LRUEviction) {
   // Verify misses still work correctly under a hot LRU cache.
   EXPECT_FALSE(disk.lookup({"z"}).has_value());
   EXPECT_FALSE(disk.lookup({"a", "b"}).has_value()); // not inserted
+
+  std::remove(testFile.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// DiskCexCache round-trip test
+//
+// Verifies that concrete assignment byte data survives a serialize → disk →
+// deserialize cycle and that DiskCexCache::findSubset returns an Assignment
+// whose bindings match what was originally stored.
+//
+// Setup:
+//   Array "myArr" (4 bytes). Constraint: myArr[0] == 42.
+//   Assignment:  myArr -> [42, 0, 0, 0]
+//
+// The test:
+//   1. Canonicalize the constraint set to get the disk key and forwardArrayMap.
+//   2. Serialize the assignment with DiskCexCache::serializeAssignment.
+//   3. Build a MapOfSets with {disk_key_string -> serialized_value} and write
+//      it to disk via MapOfSetsDiskBuilder.
+//   4. Open the file with DiskCexCache and call findSubset on the original
+//      (pre-canonicalization) constraint set.
+//   5. Assert a hit is returned, the assignment satisfies the constraint, and
+//      bindings[myArr][0] == 42.
+// ---------------------------------------------------------------------------
+
+// Shared ArrayCache for DiskCexCache tests (Arrays must outlive the cache).
+static ArrayCache diskCexAC;
+
+TEST(DiskCexCacheTest, AssignmentRoundTrip) {
+  // --- Build the original constraint: myArr[0] == 42 ---
+  const Array *myArr = diskCexAC.CreateArray("myArr", 4);
+
+  ref<Expr> idx  = ConstantExpr::create(0, Expr::Int32);
+  ref<Expr> read = ReadExpr::create(UpdateList(myArr, nullptr), idx);
+  ref<Expr> c42  = ConstantExpr::create(42, Expr::Int8);
+  ref<Expr> constraint = EqExpr::create(read, c42);
+
+  std::set<ref<Expr>> constraintSet = {constraint};
+
+  // --- Canonicalize to get the disk key and the array renaming map ---
+  std::unique_ptr<ExprBuilder> builder(createDefaultExprBuilder());
+  ArrayCache canonAC; // separate cache so canonical arrays live long enough
+  std::vector<ref<Expr>> vec(constraintSet.begin(), constraintSet.end());
+  CanonicalizationResult canon =
+      canonicalizeConstraintSet(vec, *builder, canonAC);
+
+  // Serialize each canonical constraint to produce the disk key strings.
+  std::set<std::string> diskKeySet;
+  for (const auto &e : canon.constraints) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    ExprPPrinter::printSingleExpr(os, e);
+    os.flush();
+    diskKeySet.insert(s);
+  }
+
+  // --- Build the assignment and serialize it ---
+  // myArr -> [42, 0, 0, 0]
+  std::vector<unsigned char> bytes = {42, 0, 0, 0};
+  std::vector<const Array *> objs  = {myArr};
+  std::vector<std::vector<unsigned char>> vals = {bytes};
+  Assignment assignment(objs, vals);
+
+  std::string serialized =
+      DiskCexCache::serializeAssignment(&assignment, canon.forwardArrayMap);
+
+  // Sanity-check the serialized format before writing to disk.
+  ASSERT_EQ(0u, serialized.find("SAT_DATA:"))
+      << "Serialized value must start with SAT_DATA:";
+  EXPECT_NE(std::string::npos, serialized.find("A0=2a000000"))
+      << "Expected canonical array A0 with bytes 2a000000";
+
+  // --- Write disk cache ---
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert(diskKeySet, serialized);
+
+  const std::string testFile = "disk_cex_cache_roundtrip.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+
+  // --- Query via DiskCexCache ---
+  klee::DiskCexCache cache(testFile);
+
+  Assignment *result = nullptr;
+  bool hit = cache.findSubset(constraintSet, result);
+
+  ASSERT_TRUE(hit) << "Expected a cache hit";
+  ASSERT_NE(nullptr, result) << "Expected a SAT assignment, not UNSAT";
+  EXPECT_TRUE(result->satisfies(constraintSet.begin(), constraintSet.end()))
+      << "Returned assignment does not satisfy the original constraint";
+
+  // Check the concrete byte value.
+  auto it = result->bindings.find(myArr);
+  ASSERT_NE(result->bindings.end(), it)
+      << "myArr not found in returned assignment bindings";
+  ASSERT_GE(it->second.size(), 1u);
+  EXPECT_EQ(42u, it->second[0])
+      << "Expected myArr[0] == 42 in returned assignment";
+
+  // A query with an extra unrelated constraint that the stored assignment
+  // does NOT satisfy should be a miss (pickEntry validates with satisfies()).
+  ref<Expr> c99 = ConstantExpr::create(99, Expr::Int8);
+  ref<Expr> extra = EqExpr::create(read, c99); // myArr[0] == 99, contradicts 42
+  std::set<ref<Expr>> stricter = {constraint, extra};
+  Assignment *missResult = nullptr;
+  bool miss = cache.findSubset(stricter, missResult);
+  // The stored entry is a subset of stricter, but the assignment (myArr[0]=42)
+  // does NOT satisfy myArr[0]==99, so pickEntry must reject it.
+  EXPECT_FALSE(miss) << "Assignment satisfying myArr[0]==42 should not be "
+                        "returned for a query that also requires myArr[0]==99";
 
   std::remove(testFile.c_str());
 }
