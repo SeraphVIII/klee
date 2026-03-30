@@ -241,6 +241,17 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   Expr::Kind k = e->getKind();
   ExprCanonicalOrder cmp;
 
+  // Eq and Ne are commutative but NOT associative: flattening
+  // Eq(Eq(a,b), c) into {a,b,c} would mix expression widths.
+  // Just sort the two children for a canonical argument order.
+  if (k == Expr::Eq || k == Expr::Ne) {
+    assert(e->getNumKids() == 2);
+    ref<Expr> a = e->getKid(0), b = e->getKid(1);
+    if (cmp(b, a)) std::swap(a, b);
+    std::vector<ref<Expr>> sorted = {a, b};
+    return rebuildWithKids(e, sorted);
+  }
+
   std::vector<ref<Expr>> elems;
   std::vector<ref<Expr>> stack;
   stack.push_back(e);
