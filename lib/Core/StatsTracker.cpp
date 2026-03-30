@@ -552,6 +552,8 @@ void StatsTracker::writeStatsHeader() {
          << "?,"
          << "?,"
          << "?,"
+         << "?,"
+         << "?,"
          BRANCH_TYPES
          TERMINATION_CLASSES
          << "? "
