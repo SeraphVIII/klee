@@ -268,6 +268,30 @@ DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
   return results;
 }
 
+void DiskMapOfSets::enumerate_all(uint32_t node_id,
+                                  std::set<std::string> &accum,
+                                  std::vector<Entry> &results) {
+  const auto &node = get_node(node_id);
+  if (node.is_end_of_set()) {
+    std::string v = read_value(node.value_offset());
+    results.push_back(Entry{accum, std::move(v)});
+  }
+  for (const auto &child : node.children()) {
+    std::string key = deserialize_key(child.key());
+    accum.insert(key);
+    enumerate_all(child.child_id(), accum, results);
+    accum.erase(key);
+  }
+}
+
+std::vector<DiskMapOfSets::Entry> DiskMapOfSets::allEntries() {
+  if (!valid_) return {};
+  std::vector<Entry> results;
+  std::set<std::string> accum;
+  enumerate_all(header_file_.header().root_id(), accum, results);
+  return results;
+}
+
 void DiskMapOfSets::find_supersets(
     uint32_t node_id, std::set<std::string> &accum,
     std::set<std::string>::const_iterator q_begin,

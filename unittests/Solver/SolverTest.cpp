@@ -654,4 +654,139 @@ TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
   std::remove(testFile.c_str());
 }
 
+// MergeRoundTrip verifies that allEntries() faithfully recovers every stored
+// entry, and that the merge-on-write path (seed diskWriteTree_ from existing
+// file, add new entries, rebuild) produces a file that contains both sets.
+//
+// Generation 1: {constrX -> SAT}, {constrY -> UNSAT}
+// Generation 2: merge gen1 + add {constrZ -> SAT}
+// Verify gen2 file has all three entries accessible via DiskCexCache.
+TEST(DiskCexCacheTest, MergeRoundTrip) {
+  // Reuse arrays from the shared diskCexAC (they outlive the test).
+  const Array *arrX = diskCexAC.CreateArray("arrX_m", 4);
+  const Array *arrY = diskCexAC.CreateArray("arrY_m", 4);
+  const Array *arrZ = diskCexAC.CreateArray("arrZ_m", 4);
+
+  ref<Expr> idx0 = ConstantExpr::create(0, Expr::Int32);
+  // constrX: arrX_m[0] == 7
+  ref<Expr> readX   = ReadExpr::create(UpdateList(arrX, nullptr), idx0);
+  ref<Expr> constrX = EqExpr::create(readX, ConstantExpr::create(7, Expr::Int8));
+  // constrY: arrY_m[0] == 0  (will be UNSAT)
+  ref<Expr> readY   = ReadExpr::create(UpdateList(arrY, nullptr), idx0);
+  ref<Expr> constrY = EqExpr::create(readY, ConstantExpr::create(0, Expr::Int8));
+  // constrZ: arrZ_m[0] == 42  (new in gen2)
+  ref<Expr> readZ   = ReadExpr::create(UpdateList(arrZ, nullptr), idx0);
+  ref<Expr> constrZ = EqExpr::create(readZ, ConstantExpr::create(42, Expr::Int8));
+
+  const std::string gen1File = "merge_round_trip_gen1.mapo";
+  const std::string gen2File = "merge_round_trip_gen2.mapo";
+
+  // --- Build gen1 ---
+  {
+    MapOfSetsDiskBuilder::UBTree tree;
+    ArrayCache ac;
+    std::unique_ptr<ExprBuilder> b(createDefaultExprBuilder());
+
+    auto addEntry = [&](const std::set<ref<Expr>> &constraints, Assignment *a) {
+      std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
+      CanonicalizationResult canon = canonicalizeConstraintSet(vec, *b, ac);
+      std::set<std::string> diskKey;
+      for (const auto &e : canon.constraints) {
+        std::string s; llvm::raw_string_ostream os(s);
+        ExprPPrinter::printSingleExpr(os, e); os.flush();
+        diskKey.insert(s);
+      }
+      std::string val = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
+                          : "UNSAT";
+      tree.insert(diskKey, val);
+    };
+
+    std::vector<const Array *> xObjs = {arrX};
+    std::vector<std::vector<unsigned char>> xVals = {{7,0,0,0}};
+    Assignment satX(xObjs, xVals);
+    addEntry({constrX}, &satX);
+    addEntry({constrY}, nullptr);
+    MapOfSetsDiskBuilder::build(tree, gen1File);
+  }
+
+  // --- Verify allEntries() recovers both gen1 entries ---
+  {
+    klee::mapofsets::DiskMapOfSets disk(gen1File);
+    ASSERT_TRUE(disk.isValid());
+    auto entries = disk.allEntries();
+    EXPECT_EQ(2u, entries.size()) << "allEntries() should return 2 gen1 entries";
+    // Check we have one UNSAT and one SAT_DATA entry
+    int unsatCount = 0, satCount = 0;
+    for (const auto &e : entries) {
+      if (e.value == "UNSAT") ++unsatCount;
+      else if (e.value.find("SAT_DATA:") == 0) ++satCount;
+    }
+    EXPECT_EQ(1, unsatCount) << "Expected 1 UNSAT entry";
+    EXPECT_EQ(1, satCount)   << "Expected 1 SAT entry";
+  }
+
+  // --- Build gen2: merge gen1 + add constrZ ---
+  {
+    MapOfSetsDiskBuilder::UBTree tree;
+    ArrayCache ac;
+    std::unique_ptr<ExprBuilder> b(createDefaultExprBuilder());
+
+    // Seed from gen1 (simulates the merge-on-write constructor logic)
+    klee::mapofsets::DiskMapOfSets existing(gen1File);
+    ASSERT_TRUE(existing.isValid());
+    for (auto &e : existing.allEntries())
+      tree.insert(e.key_set, e.value);
+
+    // Add new gen2 entry
+    {
+      std::vector<ref<Expr>> vec = {constrZ};
+      CanonicalizationResult canon = canonicalizeConstraintSet(vec, *b, ac);
+      std::set<std::string> diskKey;
+      for (const auto &e : canon.constraints) {
+        std::string s; llvm::raw_string_ostream os(s);
+        ExprPPrinter::printSingleExpr(os, e); os.flush();
+        diskKey.insert(s);
+      }
+      std::vector<const Array *> zObjs = {arrZ};
+      std::vector<std::vector<unsigned char>> zVals = {{42,0,0,0}};
+      Assignment satZ(zObjs, zVals);
+      tree.insert(diskKey,
+                  DiskCexCache::serializeAssignment(&satZ, canon.forwardArrayMap));
+    }
+    MapOfSetsDiskBuilder::build(tree, gen2File);
+  }
+
+  // --- Verify gen2 has all three entries ---
+  {
+    klee::mapofsets::DiskMapOfSets disk(gen2File);
+    ASSERT_TRUE(disk.isValid());
+    EXPECT_EQ(3u, disk.allEntries().size())
+        << "gen2 should contain 3 merged entries";
+  }
+
+  // --- Verify gen2 entries are queryable via DiskCexCache ---
+  DiskCexCache gen2Cache(gen2File);
+
+  std::set<ref<Expr>> qX = {constrX};
+  std::set<ref<Expr>> qY = {constrY};
+  std::set<ref<Expr>> qZ = {constrZ};
+
+  Assignment *res = nullptr;
+  ASSERT_TRUE(gen2Cache.findSubset(qX, res)) << "constrX should hit";
+  ASSERT_NE(nullptr, res);
+  EXPECT_TRUE(res->satisfies(qX.begin(), qX.end()));
+
+  res = reinterpret_cast<Assignment *>(0xdeadbeef);
+  ASSERT_TRUE(gen2Cache.findSubset(qY, res)) << "constrY should hit (UNSAT)";
+  EXPECT_EQ(nullptr, res);
+
+  res = nullptr;
+  ASSERT_TRUE(gen2Cache.findSubset(qZ, res)) << "constrZ should hit (gen2 entry)";
+  ASSERT_NE(nullptr, res);
+  EXPECT_TRUE(res->satisfies(qZ.begin(), qZ.end()));
+
+  std::remove(gen1File.c_str());
+  std::remove(gen2File.c_str());
+}
+
 }

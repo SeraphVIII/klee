@@ -35,9 +35,12 @@ public:
   
   // All subsets of query_set
   std::vector<Entry> subsets(const std::set<std::string>& query_set);
-  
-  // All supersets of query_set  
+
+  // All supersets of query_set
   std::vector<Entry> supersets(const std::set<std::string>& query_set);
+
+  // All entries in the trie (full traversal). Used for merge-on-write.
+  std::vector<Entry> allEntries();
 
 private:
   bool valid_ = false;
@@ -77,6 +80,9 @@ private:
                       std::set<std::string>::const_iterator q_begin,
                       std::set<std::string>::const_iterator q_end,
                       std::vector<Entry>& results);
+
+  void enumerate_all(uint32_t node_id, std::set<std::string> &accum,
+                     std::vector<Entry> &results);
 };
 
 }} // namespace klee::mapofsets

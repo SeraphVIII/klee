@@ -313,8 +313,22 @@ CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     : solver(std::move(solver)) {
   if (!DiskCexCacheFile.empty())
     diskCexCache_ = std::make_unique<DiskCexCache>(DiskCexCacheFile.getValue());
-  if (!WriteDiskCexCacheFile.empty())
+  if (!WriteDiskCexCacheFile.empty()) {
     diskWriteBuilder_.reset(createDefaultExprBuilder());
+    // If the write target already exists, seed diskWriteTree_ with its entries
+    // so this run accumulates on top of the existing cache rather than replacing
+    // it. The existing file is opened read-only via mmap and then closed; we
+    // overwrite it at exit with the merged tree.
+    const std::string &writePath = WriteDiskCexCacheFile.getValue();
+    mapofsets::DiskMapOfSets existing(writePath);
+    if (existing.isValid()) {
+      auto entries = existing.allEntries();
+      klee_message("Merging %zu existing entries from disk CEX cache %s",
+                   entries.size(), writePath.c_str());
+      for (auto &e : entries)
+        diskWriteTree_.insert(e.key_set, e.value);
+    }
+  }
 }
 
 
