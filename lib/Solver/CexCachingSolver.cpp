@@ -197,14 +197,17 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
 
   if (diskCexCache_) {
     Assignment *diskResult = nullptr;
-    if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult)) {
+    bool diskHit = false;
+    if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult))
+      diskHit = true;
+    if (!diskHit && diskCexCache_->findSubset(key, diskResult))
+      diskHit = true;
+    if (diskHit) {
+      ++stats::queryCexDiskCacheHits;
       result = diskResult;
       return true;
     }
-    if (!diskResult && diskCexCache_->findSubset(key, diskResult)) {
-      result = diskResult;
-      return true;
-    }
+    ++stats::queryCexDiskCacheMisses;
   }
 
   return false;

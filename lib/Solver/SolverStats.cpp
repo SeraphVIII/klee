@@ -20,6 +20,8 @@ Statistic stats::queryCacheHits("QueryCacheHits", "QChits") ;
 Statistic stats::queryCacheMisses("QueryCacheMisses", "QCmisses");
 Statistic stats::queryCexCacheHits("QueryCexCacheHits", "QCexHits") ;
 Statistic stats::queryCexCacheMisses("QueryCexCacheMisses", "QCexMisses");
+Statistic stats::queryCexDiskCacheHits("QueryCexDiskCacheHits", "QCexDHits");
+Statistic stats::queryCexDiskCacheMisses("QueryCexDiskCacheMisses", "QCexDMisses");
 Statistic stats::queryConstructs("QueryConstructs", "QB");
 Statistic stats::queryCounterexamples("QueriesCEX", "Qcex");
 Statistic stats::queryTime("QueryTime", "Qtime");

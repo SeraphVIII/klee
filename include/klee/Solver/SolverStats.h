@@ -24,6 +24,8 @@ namespace stats {
   extern Statistic queryCacheMisses;
   extern Statistic queryCexCacheHits;
   extern Statistic queryCexCacheMisses;
+  extern Statistic queryCexDiskCacheHits;
+  extern Statistic queryCexDiskCacheMisses;
   extern Statistic queryConstructs;
   extern Statistic queryCounterexamples;
   extern Statistic queryTime;
