@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <list>
 #include <unordered_map>
 #include <vector>
 #include <set>
@@ -22,7 +23,8 @@ public:
     std::string value;              // for V=string
   };
 
-  DiskMapOfSets(const std::string& filename);
+  explicit DiskMapOfSets(const std::string& filename,
+                         size_t max_cache_size = 100);
   ~DiskMapOfSets();
 
   // Exact lookup
@@ -44,9 +46,11 @@ private:
     uint64_t offset;
     uint32_t size;
     std::unique_ptr<NodeChunk> parsed;
+    std::list<uint32_t>::iterator lru_it; // position in lru_order_
   };
   std::unordered_map<uint32_t, Chunk> chunk_cache_; // chunk_id -> Chunk
-  size_t max_cache_size_ = 100; // chunks
+  std::list<uint32_t> lru_order_; // front = most recently used
+  size_t max_cache_size_;
 
   uint32_t chunk_id(uint32_t node_id) const { return node_id / header_file_.header().chunk_size(); }
   uint32_t local_id(uint32_t node_id) const { return node_id % header_file_.header().chunk_size(); }

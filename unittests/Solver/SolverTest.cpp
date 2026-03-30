@@ -400,4 +400,50 @@ TEST(DiskMapOfSetsTest, EmptySetEdgeCases) {
   std::remove(testFile.c_str());
 }
 
+// LRU eviction test.
+//
+// Build with chunkSize=1 so every node is in its own chunk.  Open with
+// max_cache_size=2 so the cache holds at most 2 chunks at a time.  Then drive
+// a sequence of lookups that exercises both eviction and re-promotion:
+//
+//   lookup "a"  → load chunk(a);           cache: [a]
+//   lookup "b"  → load chunk(b);           cache: [b, a]   (full)
+//   lookup "a"  → hit, promote chunk(a);   cache: [a, b]
+//   lookup "c"  → evict chunk(b) (LRU), load chunk(c);  cache: [c, a]
+//   lookup "b"  → evict chunk(a) (LRU), load chunk(b);  cache: [b, c]
+//   lookup "c"  → hit, promote chunk(c);   cache: [c, b]
+//   lookup "a"  → evict chunk(b) (LRU), load chunk(a);  cache: [a, c]
+//
+// Every step asserts the returned value is correct.  A stale/corrupted LRU
+// iterator (e.g. from the old erase-begin() code) would either crash on
+// splice() or evict the wrong chunk causing a lookup failure.
+TEST(DiskMapOfSetsTest, LRUEviction) {
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({"a"}, "val_a");
+  mem.insert({"b"}, "val_b");
+  mem.insert({"c"}, "val_c");
+
+  const std::string testFile = "lru_disk_cache.mapo";
+  // chunkSize=1: every trie node lives in its own chunk.
+  klee::MapOfSetsDiskBuilder::build(mem, testFile, /*chunkSize=*/1);
+
+  // max_cache_size=2: forces eviction after the second distinct chunk is loaded.
+  klee::mapofsets::DiskMapOfSets disk(testFile, /*max_cache_size=*/2);
+
+  // Access pattern designed to exercise promotion and LRU ordering.
+  EXPECT_EQ("val_a", *disk.lookup({"a"})); // load a
+  EXPECT_EQ("val_b", *disk.lookup({"b"})); // load b  (cache full)
+  EXPECT_EQ("val_a", *disk.lookup({"a"})); // hit a, promote → b becomes LRU
+  EXPECT_EQ("val_c", *disk.lookup({"c"})); // evict b, load c
+  EXPECT_EQ("val_b", *disk.lookup({"b"})); // evict a, load b
+  EXPECT_EQ("val_c", *disk.lookup({"c"})); // hit c, promote → b becomes LRU
+  EXPECT_EQ("val_a", *disk.lookup({"a"})); // evict b, load a
+
+  // Verify misses still work correctly under a hot LRU cache.
+  EXPECT_FALSE(disk.lookup({"z"}).has_value());
+  EXPECT_FALSE(disk.lookup({"a", "b"}).has_value()); // not inserted
+
+  std::remove(testFile.c_str());
+}
+
 }

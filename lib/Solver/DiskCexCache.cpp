@@ -4,7 +4,6 @@
 #include "klee/Solver/ConstraintCanonicalizer.h"
 
 #include "klee/Expr/ExprPPrinter.h"
-#include "klee/Expr/ExprVisitor.h"
 
 #include <sstream>
 
@@ -15,27 +14,25 @@ DiskCexCache::DiskCexCache(const std::string &filename,
                            const std::vector<Assignment *> &assignmentTable)
     : disk_(filename), assignmentTable_(assignmentTable), builder_(createDefaultExprBuilder()) {}
 
-// Very simple canonicalization: print the Expr in a stable textual form.
-// You can tighten this later (e.g., normalize commutative ops, sort children, etc.).
-std::string DiskCexCache::canonConstraint(ref<Expr> e) const {
-  ref<Expr> canon = klee::canonicalizeExprTree(e);
-  std::string out;
-  llvm::raw_string_ostream os(out);
-  ExprPPrinter::printSingleExpr(os, canon);
-  os.flush();
-  return out;
-}
-
 std::set<std::string>
 DiskCexCache::buildDiskKey(const std::set<ref<Expr>> &constraints) const {
   // Canonicalize as a set so array positions (A0, A1, ...) are assigned
   // consistently across all constraints, not independently per expression.
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-  CanonicalizationResult canon = klee::canonicalizeConstraintSet(vec, *builder_, arrayCache_);
-  
+  CanonicalizationResult canon =
+      klee::canonicalizeConstraintSet(vec, *builder_, arrayCache_);
+
+  // Serialize each canonicalized constraint to a string key. We use
+  // printSingleExpr directly (no trailing newline) so that the key format
+  // is unambiguous and matches what a future write path would produce.
   std::set<std::string> key;
-  for (auto &e : canon.constraints)
-    key.insert(serializeCanonicalConstraints({e}));
+  for (const auto &e : canon.constraints) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    ExprPPrinter::printSingleExpr(os, e);
+    os.flush();
+    key.insert(s);
+  }
   return key;
 }
 

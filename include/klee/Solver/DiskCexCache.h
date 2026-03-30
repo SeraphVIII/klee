@@ -55,10 +55,11 @@ private:
   std::unique_ptr<ExprBuilder> builder_;
   mutable ArrayCache arrayCache_;
 
-  /// Canonicalize a constraint expression into a stable string key.
-  std::string canonConstraint(ref<Expr> e) const;
-
-  /// Convert a set<ref<Expr>> to set<string> using canonConstraint.
+  /// Convert a set<ref<Expr>> to a set<string> disk key using full
+  /// cross-constraint canonicalization (array alpha-renaming + expr tree
+  /// normalization). The string format is ExprPPrinter output with no
+  /// trailing newline, so it is unambiguous and matches what a write path
+  /// would produce.
   std::set<std::string>
   buildDiskKey(const std::set<ref<Expr>> &constraints) const;
 

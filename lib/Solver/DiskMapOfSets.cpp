@@ -7,7 +7,8 @@
 
 using namespace klee::mapofsets;
 
-DiskMapOfSets::DiskMapOfSets(const std::string &filename) {
+DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
+    : max_cache_size_(max_cache_size) {
   fd_ = open(filename.c_str(), O_RDONLY);
   if (fd_ < 0)
     klee_error("DiskMapOfSets: cannot open '%s'", filename.c_str());
@@ -88,12 +89,17 @@ DiskMapOfSets::~DiskMapOfSets() {
 
 NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   auto it = chunk_cache_.find(chunk_id);
-  if (it != chunk_cache_.end())
+  if (it != chunk_cache_.end()) {
+    // Move to front of LRU list (most recently used).
+    lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
     return it->second.parsed.get();
+  }
 
   if (chunk_cache_.size() >= max_cache_size_) {
-    // Simple LRU: erase first
-    chunk_cache_.erase(chunk_cache_.begin());
+    // Evict least recently used (back of list).
+    uint32_t evict_id = lru_order_.back();
+    lru_order_.pop_back();
+    chunk_cache_.erase(evict_id);
   }
 
   // Directory is a simple array:
@@ -135,6 +141,8 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   }
 
   NodeChunk *raw = chunk.parsed.get();
+  lru_order_.push_front(chunk_id);
+  chunk.lru_it = lru_order_.begin();
   chunk_cache_[chunk_id] = std::move(chunk);
   return raw;
 }
