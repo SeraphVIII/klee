@@ -463,6 +463,8 @@ void StatsTracker::writeStatsHeader() {
          << "QueryCacheHits INTEGER,"
          << "QueryCexCacheMisses INTEGER,"
          << "QueryCexCacheHits INTEGER,"
+         << "QueryCexDiskCacheHits INTEGER,"
+         << "QueryCexDiskCacheMisses INTEGER,"
          << "InhibitedForks INTEGER,"
          << "ExternalCalls INTEGER,"
          << "Allocations INTEGER,"
@@ -509,6 +511,8 @@ void StatsTracker::writeStatsHeader() {
          << "QueryCacheHits,"
          << "QueryCexCacheMisses,"
          << "QueryCexCacheHits,"
+         << "QueryCexDiskCacheHits,"
+         << "QueryCexDiskCacheMisses,"
          << "InhibitedForks,"
          << "ExternalCalls,"
          << "Allocations,"
@@ -590,6 +594,8 @@ void StatsTracker::writeStatsLine() {
   sqlite3_bind_int64(insertStmt, arg++, stats::queryCacheHits);
   sqlite3_bind_int64(insertStmt, arg++, stats::queryCexCacheMisses);
   sqlite3_bind_int64(insertStmt, arg++, stats::queryCexCacheHits);
+  sqlite3_bind_int64(insertStmt, arg++, stats::queryCexDiskCacheHits);
+  sqlite3_bind_int64(insertStmt, arg++, stats::queryCexDiskCacheMisses);
   sqlite3_bind_int64(insertStmt, arg++, stats::inhibitedForks);
   sqlite3_bind_int64(insertStmt, arg++, stats::externalCalls);
   sqlite3_bind_int64(insertStmt, arg++, stats::allocations);
