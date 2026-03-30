@@ -2,7 +2,6 @@
 
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
-
 #include "klee/Expr/ExprPPrinter.h"
 
 #include "llvm/Support/raw_ostream.h"
@@ -178,6 +177,8 @@ bool DiskCexCache::pickEntry(
 
 bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
                                 Assignment *&outAssignment) {
+  if (!disk_.isValid())
+    return false;
   auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
   auto supers = disk_.supersets(diskKey);
   return pickEntry(supers, canon, constraints, outAssignment);
@@ -185,6 +186,8 @@ bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
 
 bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
                               Assignment *&outAssignment) {
+  if (!disk_.isValid())
+    return false;
   auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
   auto subs = disk_.subsets(diskKey);
   return pickEntry(subs, canon, constraints, outAssignment);

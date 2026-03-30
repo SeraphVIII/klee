@@ -44,7 +44,6 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   dfsAssign(&tree.root, nodes);
   uint32_t totalNodes = static_cast<uint32_t>(nodes.size());
 
-  klee_message("BUILDER: %u nodes\n", totalNodes);
 
   // 2. Build values blob and record per-node offsets.
   //    Stored as offset+1 so 0 means "no value".
@@ -59,7 +58,6 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     valuesBlob.append(bn.value.data(), bn.value.size());
     valueOffsets[bn.id] = offset + 1;
   }
-  klee_message("BUILDER: values blob=%zu bytes\n", valuesBlob.size());
 
   // 3. Compute directory size (fixed regardless of header size).
   uint32_t numChunks = (totalNodes + chunkSize - 1) / chunkSize;
@@ -131,7 +129,7 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   // 6. Write file.
   std::ofstream out(filename, std::ios::binary);
   if (!out) {
-    klee_message("BUILDER: cannot create %s\n", filename.c_str());
+    klee_warning("MapOfSetsDiskBuilder: cannot create '%s'", filename.c_str());
     return;
   }
 
@@ -158,5 +156,4 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   for (const auto &buf : chunkBuffers)
     out.write(buf.data(), buf.size());
 
-  klee_message("BUILDER: wrote %zu bytes OK\n", (size_t)curChunkOffset);
 }

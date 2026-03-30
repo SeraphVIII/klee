@@ -27,6 +27,9 @@ public:
                          size_t max_cache_size = 100);
   ~DiskMapOfSets();
 
+  /// Returns false if the file could not be opened or parsed.
+  bool isValid() const { return valid_; }
+
   // Exact lookup
   std::optional<std::string> lookup(const std::set<std::string>& query_set);
   
@@ -37,9 +40,10 @@ public:
   std::vector<Entry> supersets(const std::set<std::string>& query_set);
 
 private:
-  int fd_;
-  void* mmap_base_;
-  size_t file_size_;
+  bool valid_ = false;
+  int fd_ = -1;
+  void* mmap_base_ = nullptr;
+  size_t file_size_ = 0;
   MapOfSetsFile header_file_;
   
   struct Chunk {

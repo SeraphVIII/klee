@@ -4,25 +4,36 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
 
 using namespace klee::mapofsets;
 
 DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     : max_cache_size_(max_cache_size) {
+  // Helper: log a warning, clean up partially-acquired resources, and return
+  // with valid_ == false so the caller can detect a soft failure.
+  auto fail = [&](const char *msg) {
+    klee_warning("%s: %s", msg, filename.c_str());
+    if (mmap_base_ && mmap_base_ != MAP_FAILED) {
+      munmap(mmap_base_, file_size_);
+      mmap_base_ = nullptr;
+    }
+    if (fd_ >= 0) {
+      close(fd_);
+      fd_ = -1;
+    }
+    // valid_ stays false
+  };
+
   fd_ = open(filename.c_str(), O_RDONLY);
-  if (fd_ < 0)
-    klee_error("DiskMapOfSets: cannot open '%s'", filename.c_str());
+  if (fd_ < 0) { fail("DiskMapOfSets: cannot open"); return; }
 
   struct stat st;
   fstat(fd_, &st);
   file_size_ = st.st_size;
-  if (file_size_ == 0)
-    klee_error("DiskMapOfSets: file '%s' is empty", filename.c_str());
+  if (file_size_ == 0) { fail("DiskMapOfSets: file is empty"); return; }
 
   mmap_base_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0);
-  if (mmap_base_ == MAP_FAILED)
-    klee_error("DiskMapOfSets: mmap failed for '%s'", filename.c_str());
+  if (mmap_base_ == MAP_FAILED) { fail("DiskMapOfSets: mmap failed"); return; }
 
   // -------------------------------------------------------------------------
   // On-disk layout written by MapOfSetsDiskBuilder::build():
@@ -31,64 +42,40 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   // -------------------------------------------------------------------------
   static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
 
-  if (file_size_ < 16) {
-    klee_message("DiskMapOfSets: file too small (<16 bytes)\n");
-    abort();
-  }
+  if (file_size_ < 16) { fail("DiskMapOfSets: file too small (<16 bytes)"); return; }
 
   uint64_t magic = 0;
   uint64_t header_size = 0;
   memcpy(&magic, mmap_base_, 8);
   memcpy(&header_size, static_cast<const char *>(mmap_base_) + 8, 8);
 
-  klee_message("magic=0x%016llx\n", (unsigned long long)magic);
-  klee_message("header_size=%llu\n", (unsigned long long)header_size);
+  if (magic != kRawMagic) { fail("DiskMapOfSets: bad magic in"); return; }
+  if (16ULL + header_size > (uint64_t)file_size_) { fail("DiskMapOfSets: header_size out of range in"); return; }
 
-  if (magic != kRawMagic) {
-    klee_message("DiskMapOfSets: bad magic (expected 0x%016llx)\n",
-                 (unsigned long long)kRawMagic);
-    abort();
-  }
-
-  if (16ULL + header_size > (uint64_t)file_size_) {
-    klee_message("DiskMapOfSets: header_size out of range\n");
-    abort();
-  }
-
-  klee_message("About to parse protobuf header...\n");
   google::protobuf::io::ArrayInputStream stream(
       static_cast<const char *>(mmap_base_) + 16, (int)header_size);
-  bool ok = header_file_.ParseFromZeroCopyStream(&stream);
-  klee_message("parse ok=%d\n", ok);
-
-  if (!ok) {
-    klee_message("DiskMapOfSets: failed to parse header protobuf\n");
-    abort();
+  if (!header_file_.ParseFromZeroCopyStream(&stream)) {
+    fail("DiskMapOfSets: failed to parse header protobuf in");
+    return;
   }
 
   // Sanity-check directory and values regions.
   uint64_t dir_off = header_file_.header().directory_offset();
   uint64_t dir_sz  = header_file_.header().directory_size();
   if (dir_off < 16ULL + header_size || dir_off + dir_sz > (uint64_t)file_size_) {
-    klee_message("DiskMapOfSets: directory range invalid "
-                 "(dir_off=%llu dir_sz=%llu file_size=%zu)\n",
-                 (unsigned long long)dir_off, (unsigned long long)dir_sz,
-                 file_size_);
-    abort();
+    fail("DiskMapOfSets: directory range invalid in");
+    return;
   }
 
   uint64_t val_off = header_file_.header().values_offset();
   uint64_t val_sz  = header_file_.header().values_size();
   if (val_sz > 0 &&
       (val_off < 16ULL + header_size || val_off + val_sz > (uint64_t)file_size_)) {
-    klee_message("DiskMapOfSets: values region invalid "
-                 "(val_off=%llu val_sz=%llu file_size=%zu)\n",
-                 (unsigned long long)val_off, (unsigned long long)val_sz,
-                 file_size_);
-    abort();
+    fail("DiskMapOfSets: values region invalid in");
+    return;
   }
 
-  klee_message("DiskMapOfSets OK\n");
+  valid_ = true;
 }
 
 DiskMapOfSets::~DiskMapOfSets() {
@@ -196,6 +183,7 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
 
 std::optional<std::string>
 DiskMapOfSets::lookup(const std::set<std::string> &query_set) {
+  if (!valid_) return std::nullopt;
   return lookup_rec(header_file_.header().root_id(), query_set.begin(),
                     query_set.end());
 }
@@ -230,6 +218,7 @@ std::optional<std::string> DiskMapOfSets::lookup_rec(
 
 std::vector<DiskMapOfSets::Entry>
 DiskMapOfSets::subsets(const std::set<std::string> &query_set) {
+  if (!valid_) return {};
   std::vector<Entry> results;
   std::set<std::string> accum;
   find_subsets(header_file_.header().root_id(), accum,
@@ -271,6 +260,7 @@ void DiskMapOfSets::find_subsets(
 
 std::vector<DiskMapOfSets::Entry>
 DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
+  if (!valid_) return {};
   std::vector<Entry> results;
   std::set<std::string> accum;
   find_supersets(header_file_.header().root_id(), accum,
