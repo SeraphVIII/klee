@@ -561,4 +561,97 @@ TEST(DiskCexCacheTest, AssignmentRoundTrip) {
   std::remove(testFile.c_str());
 }
 
+// WriteCacheRoundTrip exercises the exact write-back pipeline used by
+// CexCachingSolver::writeCacheToDisk:
+//   in-memory MapOfSets<ref<Expr>, Assignment*>
+//     -> iterate -> canonicalize -> serialize -> MapOfSetsDiskBuilder::build
+//     -> DiskCexCache::findSubset -> reconstructed Assignment
+//
+// Two entries are written (SAT + UNSAT) so we verify both cases.
+TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
+  // --- Build two symbolic arrays and constraints ---
+  const Array *arrX = diskCexAC.CreateArray("arrX", 4);
+  const Array *arrY = diskCexAC.CreateArray("arrY", 4);
+
+  // constraint1: arrX[0] == 7
+  ref<Expr> idx0    = ConstantExpr::create(0, Expr::Int32);
+  ref<Expr> readX   = ReadExpr::create(UpdateList(arrX, nullptr), idx0);
+  ref<Expr> c7      = ConstantExpr::create(7, Expr::Int8);
+  ref<Expr> constrX = EqExpr::create(readX, c7);
+
+  // constraint2: arrY[0] == 0  (the one we'll mark UNSAT)
+  ref<Expr> readY   = ReadExpr::create(UpdateList(arrY, nullptr), idx0);
+  ref<Expr> c0      = ConstantExpr::create(0, Expr::Int8);
+  ref<Expr> constrY = EqExpr::create(readY, c0);
+
+  // Build the in-memory cache: two entries.
+  // Entry A (SAT): {constrX} -> assignment arrX[0]=7
+  // Entry B (UNSAT): {constrY} -> nullptr
+  MapOfSets<ref<Expr>, Assignment *> inMemCache;
+
+  std::vector<unsigned char> xBytes = {7, 0, 0, 0};
+  std::vector<const Array *> satObjs = {arrX};
+  std::vector<std::vector<unsigned char>> satVals = {xBytes};
+  Assignment *satA = new Assignment(satObjs, satVals);
+  inMemCache.insert({constrX}, satA);
+  inMemCache.insert({constrY}, nullptr);
+
+  // --- Replicate the writeCacheToDisk loop ---
+  MapOfSetsDiskBuilder::UBTree diskTree;
+  ArrayCache writeAC;
+  std::unique_ptr<ExprBuilder> writeBuilder(createDefaultExprBuilder());
+
+  for (auto it = inMemCache.begin(); it != inMemCache.end(); ++it) {
+    auto [keySet, assignment] = *it;
+
+    std::vector<ref<Expr>> vec(keySet.begin(), keySet.end());
+    CanonicalizationResult canon =
+        canonicalizeConstraintSet(vec, *writeBuilder, writeAC);
+
+    std::set<std::string> diskKey;
+    for (const auto &e : canon.constraints) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      ExprPPrinter::printSingleExpr(os, e);
+      os.flush();
+      diskKey.insert(s);
+    }
+
+    std::string value = assignment
+                            ? DiskCexCache::serializeAssignment(
+                                  assignment, canon.forwardArrayMap)
+                            : "UNSAT";
+    diskTree.insert(diskKey, value);
+  }
+
+  const std::string testFile = "disk_cex_cache_writeback.mapo";
+  MapOfSetsDiskBuilder::build(diskTree, testFile);
+
+  // --- Read back via DiskCexCache ---
+  DiskCexCache readCache(testFile);
+
+  // SAT entry: query {constrX} should hit and return arrX[0]==7.
+  std::set<ref<Expr>> queryX = {constrX};
+  Assignment *resultX = nullptr;
+  ASSERT_TRUE(readCache.findSubset(queryX, resultX))
+      << "Expected SAT hit for constrX query";
+  ASSERT_NE(nullptr, resultX) << "Expected non-null assignment for SAT entry";
+  EXPECT_TRUE(resultX->satisfies(queryX.begin(), queryX.end()))
+      << "Returned assignment does not satisfy constrX";
+  auto bX = resultX->bindings.find(arrX);
+  ASSERT_NE(resultX->bindings.end(), bX);
+  ASSERT_GE(bX->second.size(), 1u);
+  EXPECT_EQ(7u, bX->second[0]) << "Expected arrX[0] == 7";
+
+  // UNSAT entry: query {constrY} should hit and return nullptr.
+  std::set<ref<Expr>> queryY = {constrY};
+  Assignment *resultY = reinterpret_cast<Assignment *>(0xdeadbeef);
+  ASSERT_TRUE(readCache.findSubset(queryY, resultY))
+      << "Expected UNSAT hit for constrY query";
+  EXPECT_EQ(nullptr, resultY) << "Expected nullptr for UNSAT entry";
+
+  delete satA;
+  std::remove(testFile.c_str());
+}
+
 }

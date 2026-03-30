@@ -13,6 +13,8 @@
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
+#include "klee/Expr/ExprBuilder.h"
+#include "klee/Expr/ExprPPrinter.h"
 #include "klee/Expr/ExprUtil.h"
 #include "klee/Expr/ExprVisitor.h"
 #include "klee/Support/OptionCategories.h"
@@ -20,10 +22,12 @@
 #include "klee/Solver/SolverImpl.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Solver/DiskCexCache.h"
+#include "klee/Solver/MapOfSetsDiskBuilder.h"
 #include "klee/Solver/SolverStats.h"
 #include "klee/Support/ErrorHandling.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <utility>
@@ -36,6 +40,12 @@ namespace {
 cl::opt<std::string> DiskCexCacheFile(
     "disk-cex-cache",
     cl::desc("Path to read-only disk cex cache file (empty=disabled)"),
+    cl::init(""),
+    cl::cat(SolvingCat));
+
+cl::opt<std::string> WriteDiskCexCacheFile(
+    "write-disk-cex-cache",
+    cl::desc("If set, write the in-memory CEX cache to this file on exit"),
     cl::init(""),
     cl::cat(SolvingCat));
 
@@ -82,7 +92,9 @@ class CexCachingSolver : public SolverImpl {
   // Disk cache support
   std::unique_ptr<DiskCexCache> diskCexCache_;
 
-  bool searchForAssignment(KeyType &key, 
+  void writeCacheToDisk(const std::string &path);
+
+  bool searchForAssignment(KeyType &key,
                            Assignment *&result);
   
   bool lookupAssignment(const Query& query, KeyType &key, Assignment *&result);
@@ -296,11 +308,51 @@ CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
 
 
 CexCachingSolver::~CexCachingSolver() {
+  if (!WriteDiskCexCacheFile.empty())
+    writeCacheToDisk(WriteDiskCexCacheFile.getValue());
+
   cache.clear();
-  for (assignmentsTable_ty::iterator it = assignmentsTable.begin(), 
+  for (assignmentsTable_ty::iterator it = assignmentsTable.begin(),
          ie = assignmentsTable.end(); it != ie; ++it)
     delete *it;
+}
 
+void CexCachingSolver::writeCacheToDisk(const std::string &path) {
+  MapOfSetsDiskBuilder::UBTree diskTree;
+  ArrayCache arrayCache;
+  std::unique_ptr<ExprBuilder> builder(createDefaultExprBuilder());
+
+  unsigned written = 0;
+  for (auto it = cache.begin(); it != cache.end(); ++it) {
+    auto [keySet, assignment] = *it;
+
+    std::vector<ref<Expr>> vec(keySet.begin(), keySet.end());
+    CanonicalizationResult canon =
+        canonicalizeConstraintSet(vec, *builder, arrayCache);
+
+    std::set<std::string> diskKey;
+    for (const auto &e : canon.constraints) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      ExprPPrinter::printSingleExpr(os, e);
+      os.flush();
+      diskKey.insert(s);
+    }
+
+    std::string value;
+    if (!assignment) {
+      value = "UNSAT";
+    } else {
+      value = DiskCexCache::serializeAssignment(assignment,
+                                               canon.forwardArrayMap);
+    }
+
+    diskTree.insert(diskKey, value);
+    ++written;
+  }
+
+  klee_message("Writing %u CEX cache entries to %s", written, path.c_str());
+  MapOfSetsDiskBuilder::build(diskTree, path);
 }
 
 bool CexCachingSolver::computeValidity(const Query& query,
