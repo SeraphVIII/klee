@@ -30,6 +30,10 @@ public:
   /// Returns false if the file could not be opened or parsed.
   bool isValid() const { return valid_; }
 
+  /// Metadata stored in the file header (empty strings if not present).
+  std::string solverBackend() const { return header_file_.header().solver_backend(); }
+  std::string kleeVersion()   const { return header_file_.header().klee_version(); }
+
   // Exact lookup
   std::optional<std::string> lookup(const std::set<std::string>& query_set);
   

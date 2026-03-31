@@ -5,6 +5,7 @@
 
 #include "DiskMapOfSets.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
+#include "klee/Solver/MapOfSetsDiskBuilder.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
 #include "klee/Expr/ExprBuilder.h"
@@ -37,7 +38,11 @@ public:
                       const std::map<const Array *, const Array *> &forwardArrayMap);
 
   /// Open a disk cache file for reading.
-  explicit DiskCexCache(const std::string &filename);
+  /// `current` describes the running KLEE instance; if the file was written
+  /// with different metadata a warning is emitted (the cache is still used
+  /// since SAT assignments are re-verified and UNSAT results are solver-agnostic).
+  explicit DiskCexCache(const std::string &filename,
+                        const CacheMetadata &current = {});
 
   /// Try to find a cached result for `constraints`, checking supersets first
   /// (if trySuperset is true) then subsets, with a single canonicalization.

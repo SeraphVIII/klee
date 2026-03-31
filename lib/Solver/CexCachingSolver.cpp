@@ -22,8 +22,10 @@
 #include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/MapOfSetsDiskBuilder.h"
+#include "klee/Solver/SolverCmdLine.h"
 #include "klee/Solver/SolverStats.h"
 #include "klee/Support/ErrorHandling.h"
+#include "klee/Config/config.h"
 
 #include "llvm/Support/CommandLine.h"
 
@@ -32,6 +34,26 @@
 
 using namespace klee;
 using namespace llvm;
+
+/// Returns the active core solver backend as a short lowercase string
+/// suitable for storing in the cache file metadata.
+static std::string currentSolverBackendName() {
+  switch (CoreSolverToUse) {
+  case STP_SOLVER:     return "stp";
+  case Z3_SOLVER:      return "z3";
+  case METASMT_SOLVER: return "metasmt";
+  default:             return "unknown";
+  }
+}
+
+static CacheMetadata buildCacheMetadata() {
+  CacheMetadata m;
+  m.solverBackend = currentSolverBackendName();
+#ifdef PACKAGE_STRING
+  m.kleeVersion = PACKAGE_STRING;
+#endif
+  return m;
+}
 
 namespace {
 
@@ -305,7 +327,8 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     : solver(std::move(solver)) {
   if (!DiskCexCacheFile.empty())
-    diskCexCache_ = std::make_unique<DiskCexCache>(DiskCexCacheFile.getValue());
+    diskCexCache_ = std::make_unique<DiskCexCache>(DiskCexCacheFile.getValue(),
+                                                   buildCacheMetadata());
   if (!WriteDiskCexCacheFile.empty())
     diskWriteBuilder_.reset(createDefaultExprBuilder());
 }
@@ -334,7 +357,7 @@ CexCachingSolver::~CexCachingSolver() {
     }
 
     klee_message("Writing disk CEX cache to %s", path.c_str());
-    MapOfSetsDiskBuilder::build(diskWriteTree_, path);
+    MapOfSetsDiskBuilder::build(diskWriteTree_, path, buildCacheMetadata());
   }
 
   cache.clear();

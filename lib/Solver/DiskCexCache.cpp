@@ -2,6 +2,7 @@
 
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
+#include "klee/Support/ErrorHandling.h"
 
 #include <algorithm>
 #include <cassert>
@@ -14,8 +15,31 @@ using mapofsets::DiskMapOfSets;
 // Construction
 // ---------------------------------------------------------------------------
 
-DiskCexCache::DiskCexCache(const std::string &filename)
-    : disk_(filename), builder_(createDefaultExprBuilder()) {}
+DiskCexCache::DiskCexCache(const std::string &filename,
+                           const CacheMetadata &current)
+    : disk_(filename), builder_(createDefaultExprBuilder()) {
+  if (!disk_.isValid())
+    return;
+
+  const std::string &storedSolver  = disk_.solverBackend();
+  const std::string &storedVersion = disk_.kleeVersion();
+
+  // Warn if the cache was written with a different solver backend.  SAT
+  // assignments are re-verified by Assignment::satisfies() so a stale hit is
+  // caught; UNSAT results are logically solver-agnostic.  We warn rather than
+  // reject so that a solver upgrade doesn't silently discard a large cache.
+  if (!current.solverBackend.empty() && !storedSolver.empty() &&
+      current.solverBackend != storedSolver)
+    klee_warning("DiskCexCache: cache was written with solver '%s' "
+                 "but current solver is '%s'; results will be re-verified",
+                 storedSolver.c_str(), current.solverBackend.c_str());
+
+  if (!current.kleeVersion.empty() && !storedVersion.empty() &&
+      current.kleeVersion != storedVersion)
+    klee_warning("DiskCexCache: cache was written with %s, "
+                 "current build is %s",
+                 storedVersion.c_str(), current.kleeVersion.c_str());
+}
 
 // ---------------------------------------------------------------------------
 // Serialization (public static — used by the write path and tests)

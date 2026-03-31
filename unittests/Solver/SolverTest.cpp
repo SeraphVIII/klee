@@ -432,7 +432,7 @@ TEST(DiskMapOfSetsTest, LRUEviction) {
 
   const std::string testFile = "lru_disk_cache.mapo";
   // chunkSize=1: every trie node lives in its own chunk.
-  klee::MapOfSetsDiskBuilder::build(mem, testFile, /*chunkSize=*/1);
+  klee::MapOfSetsDiskBuilder::build(mem, testFile, /*metadata=*/{}, /*chunkSize=*/1);
 
   // max_cache_size=2: forces eviction after the second distinct chunk is loaded.
   klee::mapofsets::DiskMapOfSets disk(testFile, /*max_cache_size=*/2);

@@ -15,6 +15,8 @@ message Header {
   uint64 values_size              = 10; // byte size of values region
   uint64 string_table_offset      = 11; // byte offset of string table in file
   uint64 string_table_size        = 12; // byte size of string table
+  string solver_backend           = 13; // solver that produced this cache (e.g. "z3", "stp")
+  string klee_version             = 14; // KLEE version string at write time
 }
 
 message Child {

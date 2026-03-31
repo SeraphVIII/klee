@@ -27,6 +27,7 @@ void MapOfSetsDiskBuilder::dfsAssign(const MapOfSetsDiskBuilder::UBTree::Node *s
 
 void MapOfSetsDiskBuilder::build(const UBTree &tree,
                                  const std::string &filename,
+                                 const CacheMetadata &metadata,
                                  uint32_t chunkSize) {
   // -------------------------------------------------------------------------
   // On-disk layout (v2):
@@ -126,6 +127,10 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   // serialization format changes so that readers can reject stale cache files.
   static constexpr uint32_t kCanonVersion = 1;
   hdr->set_canonicalization_version(kCanonVersion);
+  if (!metadata.solverBackend.empty())
+    hdr->set_solver_backend(metadata.solverBackend);
+  if (!metadata.kleeVersion.empty())
+    hdr->set_klee_version(metadata.kleeVersion);
   hdr->set_root_id(0);
   hdr->set_total_nodes(totalNodes);
   hdr->set_chunk_size(chunkSize);
