@@ -122,6 +122,10 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   mapofsets::Header *hdr = file.mutable_header();
   hdr->set_magic(kRawMagic);
   hdr->set_version(2);
+  // Increment kCanonVersion whenever the canonicalization algorithm or key
+  // serialization format changes so that readers can reject stale cache files.
+  static constexpr uint32_t kCanonVersion = 1;
+  hdr->set_canonicalization_version(kCanonVersion);
   hdr->set_root_id(0);
   hdr->set_total_nodes(totalNodes);
   hdr->set_chunk_size(chunkSize);
@@ -129,8 +133,13 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   hdr->set_values_size(valuesBlob.size());
   hdr->set_string_table_size(stringTableBlob.size());
 
+  // The serialized header size affects its own field offsets (protobuf uses
+  // varint encoding, so a larger offset value can grow the blob).  We iterate
+  // until the serialized size stabilises — in practice this converges in 1-2
+  // iterations because varint growth is bounded and the offsets only grow once.
   std::string finalHeaderBlob;
   uint64_t lastSize = 0;
+  bool converged = false;
   for (int iter = 0; iter < 8; ++iter) {
     std::string tmp;
     file.SerializeToString(&tmp);
@@ -145,11 +154,15 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
 
     if (sz == lastSize) {
       finalHeaderBlob = std::move(tmp);
+      converged = true;
       break;
     }
     lastSize = sz;
     finalHeaderBlob = std::move(tmp);
   }
+  if (!converged)
+    klee_warning("MapOfSetsDiskBuilder: header offset fixed-point did not "
+                 "converge; output file '%s' may be corrupt", filename.c_str());
 
   uint64_t headerSize = finalHeaderBlob.size();
   uint64_t dirOffset  = kPreambleSize + headerSize;

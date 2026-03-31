@@ -64,9 +64,9 @@ private:
   std::vector<std::unique_ptr<Assignment>> ownedAssignments_;
 
   enum class ValueKind {
-    Unsat,        ///< "UNSAT" sentinel
-    AssignmentData, ///< "SAT_DATA:..." with inline byte data
-    Unknown       ///< unrecognised format, treat as miss
+    Unsat,          ///< empty value: UNSAT sentinel
+    AssignmentData, ///< starts with 0x01: inline binary assignment
+    Unknown         ///< unrecognised format, treat as miss
   };
 
   struct ParsedValue {
@@ -74,20 +74,16 @@ private:
     std::string satData; // valid iff kind == AssignmentData
   };
 
-  /// Canonicalize constraints and return both the disk key set and the full
-  /// CanonicalizationResult (which carries the inverse array map needed to
-  /// reconstruct assignments on a cache hit).
-  std::pair<std::set<std::string>, CanonicalizationResult>
-  buildDiskKeyAndCanon(const std::set<ref<Expr>> &constraints) const;
-
   ParsedValue parseValue(const std::string &val) const;
 
-  /// Deserialize a "SAT_DATA:..." string into an Assignment whose bindings
-  /// reference the original (pre-canonicalization) arrays from `canon`.
+  /// Deserialize a binary assignment from `data` into an Assignment whose
+  /// bindings reference the original arrays via `nameToOrig`
+  /// (canonical name -> original Array*).
   /// Returns nullptr on parse failure. The returned pointer is owned by
   /// ownedAssignments_ and remains valid for the lifetime of this object.
-  Assignment *parseAssignmentData(const std::string &data,
-                                  const CanonicalizationResult &canon);
+  Assignment *parseAssignmentData(
+      const std::string &data,
+      const std::map<std::string, const Array *> &nameToOrig);
 
   bool pickEntry(const std::vector<mapofsets::DiskMapOfSets::Entry> &entries,
                  const CanonicalizationResult &canon,

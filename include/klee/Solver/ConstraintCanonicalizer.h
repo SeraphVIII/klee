@@ -4,6 +4,7 @@
 #include "klee/Expr/Expr.h"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,16 @@ std::string serializeCanonicalConstraints(
 /// Compute a stable key (e.g. SHA-1 hex) for a canonical constraint list.
 std::string computeCanonicalKey(
     const std::vector<klee::ref<Expr>> &canonConstraints);
+
+/// Build the disk lookup key (set of printed canonical constraint strings) and
+/// the full CanonicalizationResult in a single pass.  Both the read path
+/// (DiskCexCache) and the write path (CexCachingSolver) use identical key
+/// construction; this function is the single authoritative implementation so
+/// that any future change to the key format only needs to be made here.
+std::pair<std::set<std::string>, CanonicalizationResult>
+buildConstraintDiskKey(const std::vector<klee::ref<Expr>> &constraints,
+                       ExprBuilder &builder,
+                       ArrayCache &arrayCache);
 
 } // namespace klee
 

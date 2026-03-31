@@ -14,7 +14,6 @@
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
 #include "klee/Expr/ExprBuilder.h"
-#include "klee/Expr/ExprPPrinter.h"
 #include "klee/Expr/ExprUtil.h"
 #include "klee/Expr/ExprVisitor.h"
 #include "klee/Support/OptionCategories.h"
@@ -27,7 +26,6 @@
 #include "klee/Support/ErrorHandling.h"
 
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <utility>
@@ -347,18 +345,11 @@ CexCachingSolver::~CexCachingSolver() {
 
 void CexCachingSolver::addToDiskWriteTree(const KeyType &key, Assignment *a) {
   // Canonicalize eagerly while all Array objects are still alive.
+  // buildConstraintDiskKey is the shared implementation used by the read path
+  // (DiskCexCache) — using it here guarantees write and read keys are identical.
   std::vector<ref<Expr>> vec(key.begin(), key.end());
-  CanonicalizationResult canon =
-      canonicalizeConstraintSet(vec, *diskWriteBuilder_, diskWriteArrayCache_);
-
-  std::set<std::string> diskKey;
-  for (const auto &e : canon.constraints) {
-    std::string s;
-    llvm::raw_string_ostream os(s);
-    ExprPPrinter::printSingleExpr(os, e);
-    os.flush();
-    diskKey.insert(s);
-  }
+  auto [diskKey, canon] =
+      buildConstraintDiskKey(vec, *diskWriteBuilder_, diskWriteArrayCache_);
 
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
                         : ""; // empty = UNSAT sentinel in v2 binary format

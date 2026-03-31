@@ -61,6 +61,18 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     return;
   }
 
+  // Canonicalization version check: keys are produced by
+  // buildConstraintDiskKey; if the algorithm changes the version is bumped so
+  // that stale files are rejected rather than silently producing all misses.
+  // Files written before this field was added have version 0 (proto3 default)
+  // and must be rebuilt.
+  static constexpr uint32_t kExpectedCanonVersion = 1;
+  uint32_t canon_version = header_file_.header().canonicalization_version();
+  if (canon_version != kExpectedCanonVersion) {
+    fail("DiskMapOfSets: canonicalization version mismatch (delete and re-run) in");
+    return;
+  }
+
   // Validate directory region.
   uint64_t dir_off = header_file_.header().directory_offset();
   uint64_t dir_sz  = header_file_.header().directory_size();
@@ -276,6 +288,8 @@ void DiskMapOfSets::find_supersets(
   const auto &node = get_node(node_id);
 
   if (q_begin == q_end) {
+    // All query elements have been matched: any path from here to an
+    // end-of-set node is a valid superset, so enumerate everything below.
     if (node.is_end_of_set())
       results.push_back(Entry{accum, read_value(node.value_offset())});
 
@@ -286,6 +300,7 @@ void DiskMapOfSets::find_supersets(
       accum.erase(child_key);
     }
   } else {
+    // Still have query elements to match.  Children and query are both sorted.
     const std::string &elt = *q_begin;
     auto next_q = std::next(q_begin);
 
@@ -294,10 +309,17 @@ void DiskMapOfSets::find_supersets(
       accum.insert(child_key);
 
       if (child_key == elt) {
+        // This edge matches the current query element; advance the query.
         find_supersets(child.child_id(), accum, next_q, q_end, results);
       } else if (child_key < elt) {
+        // This edge is a superset-only element that sorts before elt.  The
+        // superset may contain arbitrary extra elements, so follow this child
+        // without advancing the query — elt may still appear further down.
         find_supersets(child.child_id(), accum, q_begin, q_end, results);
       } else {
+        // child_key > elt: since children are sorted and only increase along
+        // this level, elt can never be matched by any remaining child.  No
+        // superset is reachable from here; stop scanning.
         accum.erase(child_key);
         break;
       }

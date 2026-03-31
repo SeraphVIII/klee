@@ -2,11 +2,9 @@
 
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
-#include "klee/Expr/ExprPPrinter.h"
-
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 using namespace klee;
@@ -33,6 +31,9 @@ DiskCexCache::DiskCexCache(const std::string &filename)
 std::string DiskCexCache::serializeAssignment(
     const Assignment *a,
     const std::map<const Array *, const Array *> &forwardArrayMap) {
+  assert(forwardArrayMap.size() <= 255 &&
+         "serializeAssignment: too many symbolic arrays for binary format (max 255)");
+
   struct Entry { uint8_t idx; const std::vector<unsigned char> *bytes; };
   std::vector<Entry> entries;
   entries.reserve(forwardArrayMap.size());
@@ -40,6 +41,11 @@ std::string DiskCexCache::serializeAssignment(
   for (const auto &[orig, canon] : forwardArrayMap) {
     uint8_t idx = static_cast<uint8_t>(std::stoi(canon->name.substr(1)));
     auto it = a->bindings.find(orig);
+    // An array that appears in the constraint set but has no binding in the
+    // assignment is written with data_len=0.  This is distinct from the UNSAT
+    // sentinel (the entire value blob being absent): here we are inside a SAT
+    // record (marker byte 0x01 is present) and len=0 simply means the array
+    // was unconstrained in this particular assignment.
     static const std::vector<unsigned char> empty;
     entries.push_back({idx, it != a->bindings.end() ? &it->second : &empty});
   }
@@ -58,29 +64,6 @@ std::string DiskCexCache::serializeAssignment(
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Key construction
-// ---------------------------------------------------------------------------
-
-std::pair<std::set<std::string>, CanonicalizationResult>
-DiskCexCache::buildDiskKeyAndCanon(
-    const std::set<ref<Expr>> &constraints) const {
-  std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-  CanonicalizationResult canon =
-      klee::canonicalizeConstraintSet(vec, *builder_, arrayCache_);
-
-  // Serialize each canonicalized constraint to a string key using
-  // printSingleExpr with no trailing newline, for an unambiguous format.
-  std::set<std::string> key;
-  for (const auto &e : canon.constraints) {
-    std::string s;
-    llvm::raw_string_ostream os(s);
-    ExprPPrinter::printSingleExpr(os, e);
-    os.flush();
-    key.insert(s);
-  }
-  return {std::move(key), std::move(canon)};
-}
 
 // ---------------------------------------------------------------------------
 // Value parsing
@@ -100,13 +83,9 @@ DiskCexCache::parseValue(const std::string &val) const {
 // ---------------------------------------------------------------------------
 
 Assignment *
-DiskCexCache::parseAssignmentData(const std::string &data,
-                                  const CanonicalizationResult &canon) {
-  // Build canonical_name -> original Array* from the forward map.
-  std::map<std::string, const Array *> nameToOrig;
-  for (const auto &[orig, can] : canon.forwardArrayMap)
-    nameToOrig[can->name] = orig;
-
+DiskCexCache::parseAssignmentData(
+    const std::string &data,
+    const std::map<std::string, const Array *> &nameToOrig) {
   // Binary format: [0x01][n_arrays]([name_index][u32 data_len LE][bytes])×n
   if (data.size() < 2) return nullptr;
   uint8_t n_arrays = static_cast<uint8_t>(data[1]);
@@ -149,6 +128,12 @@ bool DiskCexCache::pickEntry(
     const CanonicalizationResult &canon,
     const std::set<ref<Expr>> &originalConstraints,
     Assignment *&outAssignment) {
+  // Build canonical_name -> original Array* once for all entries in this call;
+  // all entries share the same CanonicalizationResult.
+  std::map<std::string, const Array *> nameToOrig;
+  for (const auto &[orig, can] : canon.forwardArrayMap)
+    nameToOrig[can->name] = orig;
+
   for (const auto &e : entries) {
     ParsedValue pv = parseValue(e.value);
     switch (pv.kind) {
@@ -157,7 +142,7 @@ bool DiskCexCache::pickEntry(
       outAssignment = nullptr;
       return true;
     case ValueKind::AssignmentData: {
-      Assignment *a = parseAssignmentData(pv.satData, canon);
+      Assignment *a = parseAssignmentData(pv.satData, nameToOrig);
       if (a && a->satisfies(originalConstraints.begin(),
                             originalConstraints.end())) {
         outAssignment = a;
@@ -182,7 +167,8 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
                         Assignment *&outAssignment) {
   if (!disk_.isValid())
     return false;
-  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
+  std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   if (trySuperset) {
     auto supers = disk_.supersets(diskKey);
     if (pickEntry(supers, canon, constraints, outAssignment))
@@ -196,7 +182,8 @@ bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
                                 Assignment *&outAssignment) {
   if (!disk_.isValid())
     return false;
-  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
+  std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   auto supers = disk_.supersets(diskKey);
   return pickEntry(supers, canon, constraints, outAssignment);
 }
@@ -205,7 +192,8 @@ bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
                               Assignment *&outAssignment) {
   if (!disk_.isValid())
     return false;
-  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
+  std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   auto subs = disk_.subsets(diskKey);
   return pickEntry(subs, canon, constraints, outAssignment);
 }

@@ -317,6 +317,9 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   res.constraints = constraints;
 
   ExprCanonicalOrder cmp;
+  // First sort: establish a deterministic DFS encounter order for arrays so
+  // that the first-seen array gets canonical name A0, the second A1, etc.
+  // The ordering of constraints here drives which array gets which index.
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   std::unordered_map<const Array *, unsigned> order;
@@ -353,6 +356,10 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   for (auto &e : res.constraints)
     e = canonicalizeExprTree(e);
 
+  // Second sort: array renaming (A0, A1, ...) and expression-tree
+  // canonicalization can both change expression structure, which may alter
+  // their relative order under ExprCanonicalOrder.  Re-sort to restore the
+  // canonical ordering before the constraints are serialized into disk keys.
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   return res;
@@ -386,6 +393,24 @@ std::string computeCanonicalKey(
     hex.push_back("0123456789abcdef"[b & 0xf]);
   }
   return hex;
+}
+
+std::pair<std::set<std::string>, CanonicalizationResult>
+buildConstraintDiskKey(const std::vector<ref<Expr>> &constraints,
+                       ExprBuilder &builder,
+                       ArrayCache &arrayCache) {
+  CanonicalizationResult canon =
+      canonicalizeConstraintSet(constraints, builder, arrayCache);
+
+  std::set<std::string> key;
+  for (const auto &e : canon.constraints) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    ExprPPrinter::printSingleExpr(os, e);
+    os.flush();
+    key.insert(s);
+  }
+  return {std::move(key), std::move(canon)};
 }
 
 } // namespace klee
