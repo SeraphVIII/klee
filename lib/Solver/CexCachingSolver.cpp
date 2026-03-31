@@ -216,12 +216,7 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
 
   if (diskCexCache_) {
     Assignment *diskResult = nullptr;
-    bool diskHit = false;
-    if (CexCacheSuperSet && diskCexCache_->findSuperset(key, diskResult))
-      diskHit = true;
-    if (!diskHit && diskCexCache_->findSubset(key, diskResult))
-      diskHit = true;
-    if (diskHit) {
+    if (diskCexCache_->find(key, CexCacheSuperSet, diskResult)) {
       ++stats::queryCexDiskCacheHits;
       result = diskResult;
       return true;

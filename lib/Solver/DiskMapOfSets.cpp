@@ -242,15 +242,14 @@ void DiskMapOfSets::find_subsets(
 
   for (auto q_it = q_begin; q_it != q_end; ++q_it) {
     const std::string &elt = *q_it;
-    const auto &node2 = get_node(node_id);
 
     auto child_it = std::lower_bound(
-        node2.children().begin(), node2.children().end(), elt,
+        node.children().begin(), node.children().end(), elt,
         [this](const Child &c, const std::string &t) {
           return key_str(c.key_index()) < t;
         });
 
-    if (child_it != node2.children().end() &&
+    if (child_it != node.children().end() &&
         key_str(child_it->key_index()) == elt) {
       accum.insert(elt);
       find_subsets(child_it->child_id(), accum, std::next(q_it), q_end, results);

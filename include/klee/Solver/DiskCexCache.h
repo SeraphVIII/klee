@@ -20,12 +20,9 @@ namespace klee {
 
 /// Read-only CEX cache backed by DiskMapOfSets.
 ///
-/// Values on disk use one of two formats:
-///   "UNSAT"                          — unsatisfiable sentinel
-///   "SAT_DATA:<name>=<hex>;<name>=<hex>;..."
-///                                    — concrete assignment, one entry per
-///                                      canonical array (A0, A1, ...), hex
-///                                      encoding of byte values
+/// Values on disk use binary v2 format (see DiskCexCache::serializeAssignment):
+///   SAT:   [u8 0x01][u8 n_arrays]([u8 name_idx][u32 data_len][bytes])×n
+///   UNSAT: empty string (zero bytes)
 ///
 /// Keys are produced by canonicalizeConstraintSet() followed by
 /// ExprPPrinter::printSingleExpr() (no trailing newline) for each constraint.
@@ -41,6 +38,13 @@ public:
 
   /// Open a disk cache file for reading.
   explicit DiskCexCache(const std::string &filename);
+
+  /// Try to find a cached result for `constraints`, checking supersets first
+  /// (if trySuperset is true) then subsets, with a single canonicalization.
+  /// Returns true on hit; outAssignment is non-nullptr for SAT, nullptr for UNSAT.
+  bool find(const std::set<ref<Expr>> &constraints,
+            bool trySuperset,
+            Assignment *&outAssignment);
 
   /// Try to find a cached SAT assignment for a superset of `constraints`.
   /// Returns true on hit; outAssignment is non-nullptr for SAT, nullptr for UNSAT.

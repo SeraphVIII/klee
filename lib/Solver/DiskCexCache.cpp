@@ -177,6 +177,21 @@ bool DiskCexCache::pickEntry(
 // Public interface
 // ---------------------------------------------------------------------------
 
+bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
+                        bool trySuperset,
+                        Assignment *&outAssignment) {
+  if (!disk_.isValid())
+    return false;
+  auto [diskKey, canon] = buildDiskKeyAndCanon(constraints);
+  if (trySuperset) {
+    auto supers = disk_.supersets(diskKey);
+    if (pickEntry(supers, canon, constraints, outAssignment))
+      return true;
+  }
+  auto subs = disk_.subsets(diskKey);
+  return pickEntry(subs, canon, constraints, outAssignment);
+}
+
 bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
                                 Assignment *&outAssignment) {
   if (!disk_.isValid())

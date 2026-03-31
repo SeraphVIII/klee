@@ -9,6 +9,7 @@
 #include "llvm/Support/SHA1.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 using namespace klee;
 
@@ -64,11 +65,11 @@ namespace {
 /// or allocation order.
 ///===----------------------------------------------------------------------===//
 class ArrayOrderCollector : public ExprVisitor {
-  std::map<const Array *, unsigned> &order_;
+  std::unordered_map<const Array *, unsigned> &order_;
   unsigned &nextIndex_;
 
 public:
-  ArrayOrderCollector(std::map<const Array *, unsigned> &order,
+  ArrayOrderCollector(std::unordered_map<const Array *, unsigned> &order,
                       unsigned &nextIndex)
       : ExprVisitor(/*recursive=*/true), order_(order), nextIndex_(nextIndex) {}
 
@@ -267,9 +268,6 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
     }
   }
 
-  for (auto &c : elems)
-    c = klee::canonicalizeExprTree(c);
-
   std::sort(elems.begin(), elems.end(), cmp);
 
   while (elems.size() > 1) {
@@ -321,7 +319,7 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   ExprCanonicalOrder cmp;
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
-  std::map<const Array *, unsigned> order;
+  std::unordered_map<const Array *, unsigned> order;
   unsigned nextIndex = 0;
   ArrayOrderCollector collector(order, nextIndex);
   for (auto &e : res.constraints)
