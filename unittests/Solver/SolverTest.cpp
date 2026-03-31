@@ -24,6 +24,8 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstring>
+
 #include <iostream>
 
 using namespace klee;
@@ -514,11 +516,15 @@ TEST(DiskCexCacheTest, AssignmentRoundTrip) {
   std::string serialized =
       DiskCexCache::serializeAssignment(&assignment, canon.forwardArrayMap);
 
-  // Sanity-check the serialized format before writing to disk.
-  ASSERT_EQ(0u, serialized.find("SAT_DATA:"))
-      << "Serialized value must start with SAT_DATA:";
-  EXPECT_NE(std::string::npos, serialized.find("A0=2a000000"))
-      << "Expected canonical array A0 with bytes 2a000000";
+  // Sanity-check the v2 binary format: [0x01][n=1][idx=0][len=4][42,0,0,0]
+  ASSERT_GE(serialized.size(), 8u) << "Serialized value too short";
+  EXPECT_EQ('\x01', serialized[0]) << "Expected SAT sentinel 0x01";
+  EXPECT_EQ('\x01', serialized[1]) << "Expected n_arrays=1";
+  EXPECT_EQ('\x00', serialized[2]) << "Expected name_index=0 (A0)";
+  uint32_t storedLen = 0;
+  memcpy(&storedLen, &serialized[3], 4);
+  EXPECT_EQ(4u, storedLen) << "Expected data_len=4";
+  EXPECT_EQ(42u, static_cast<unsigned char>(serialized[7])) << "Expected byte[0]==42";
 
   // --- Write disk cache ---
   klee::MapOfSets<std::string, std::string> mem;
@@ -620,7 +626,7 @@ TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
     std::string value = assignment
                             ? DiskCexCache::serializeAssignment(
                                   assignment, canon.forwardArrayMap)
-                            : "UNSAT";
+                            : ""; // empty = UNSAT sentinel in v2 binary format
     diskTree.insert(diskKey, value);
   }
 
@@ -697,7 +703,7 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
         diskKey.insert(s);
       }
       std::string val = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
-                          : "UNSAT";
+                          : ""; // empty = UNSAT sentinel in v2 binary format
       tree.insert(diskKey, val);
     };
 
@@ -715,11 +721,11 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
     ASSERT_TRUE(disk.isValid());
     auto entries = disk.allEntries();
     EXPECT_EQ(2u, entries.size()) << "allEntries() should return 2 gen1 entries";
-    // Check we have one UNSAT and one SAT_DATA entry
+    // Check we have one UNSAT (empty value) and one SAT (0x01-prefixed) entry
     int unsatCount = 0, satCount = 0;
     for (const auto &e : entries) {
-      if (e.value == "UNSAT") ++unsatCount;
-      else if (e.value.find("SAT_DATA:") == 0) ++satCount;
+      if (e.value.empty()) ++unsatCount;
+      else if (!e.value.empty() && static_cast<unsigned char>(e.value[0]) == 0x01) ++satCount;
     }
     EXPECT_EQ(1, unsatCount) << "Expected 1 UNSAT entry";
     EXPECT_EQ(1, satCount)   << "Expected 1 SAT entry";

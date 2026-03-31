@@ -3,20 +3,23 @@ syntax = "proto3";
 package klee.mapofsets;
 
 message Header {
-  uint64 magic            = 1;  // 0x4d41504f53455453ULL ("MAPOSETS")
-  uint32 version          = 2;  // 1
-  uint32 root_id          = 3;
-  uint64 total_nodes      = 4;
-  uint32 chunk_size       = 6;  // nodes per chunk
-  uint64 directory_offset = 7;  // byte offset of directory in file
-  uint64 directory_size   = 8;  // byte size of directory
-  uint64 values_offset    = 9;  // byte offset of values region in file
-  uint64 values_size      = 10; // byte size of values region
+  uint64 magic                = 1;  // 0x4d41504f53455453ULL ("MAPOSETS")
+  uint32 version              = 2;  // 2 (v1 is no longer supported)
+  uint32 root_id              = 3;
+  uint64 total_nodes          = 4;
+  uint32 chunk_size           = 6;  // nodes per chunk
+  uint64 directory_offset     = 7;  // byte offset of directory in file
+  uint64 directory_size       = 8;  // byte size of directory
+  uint64 values_offset        = 9;  // byte offset of values region in file
+  uint64 values_size          = 10; // byte size of values region
+  uint64 string_table_offset  = 11; // byte offset of string table in file
+  uint64 string_table_size    = 12; // byte size of string table
 }
 
 message Child {
-  bytes  key      = 1;  // serialized K
-  uint32 child_id = 2;
+  bytes  key       = 1;  // unused in v2; kept for proto field number stability
+  uint32 child_id  = 2;
+  uint32 key_index = 3;  // v2: index into the file's string table
 }
 
 message Node {

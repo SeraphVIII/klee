@@ -6,19 +6,11 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <cstring>
+
 using namespace klee;
 using mapofsets::DiskMapOfSets;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static int hexNibble(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -29,24 +21,39 @@ DiskCexCache::DiskCexCache(const std::string &filename)
 
 // ---------------------------------------------------------------------------
 // Serialization (public static — used by the write path and tests)
+//
+// Binary value format (v2):
+//   SAT:  [u8 0x01][u8 n_arrays]
+//           ([u8 name_index][u32 data_len LE][data_len bytes]) × n_arrays
+//   UNSAT: empty string (zero-byte entry in the values blob)
+//
+// name_index is the integer suffix of canonical array name "A{n}".
 // ---------------------------------------------------------------------------
 
 std::string DiskCexCache::serializeAssignment(
     const Assignment *a,
     const std::map<const Array *, const Array *> &forwardArrayMap) {
-  std::string out = "SAT_DATA:";
+  struct Entry { uint8_t idx; const std::vector<unsigned char> *bytes; };
+  std::vector<Entry> entries;
+  entries.reserve(forwardArrayMap.size());
+
   for (const auto &[orig, canon] : forwardArrayMap) {
-    out += canon->name;
-    out += '=';
+    uint8_t idx = static_cast<uint8_t>(std::stoi(canon->name.substr(1)));
     auto it = a->bindings.find(orig);
-    if (it != a->bindings.end()) {
-      for (unsigned char b : it->second) {
-        out += "0123456789abcdef"[b >> 4];
-        out += "0123456789abcdef"[b & 0xf];
-      }
-    }
-    // An empty hex string is valid and decodes to an empty byte vector.
-    out += ';';
+    static const std::vector<unsigned char> empty;
+    entries.push_back({idx, it != a->bindings.end() ? &it->second : &empty});
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry &x, const Entry &y) { return x.idx < y.idx; });
+
+  std::string out;
+  out.push_back('\x01');
+  out.push_back(static_cast<char>(entries.size()));
+  for (const auto &e : entries) {
+    out.push_back(static_cast<char>(e.idx));
+    uint32_t len = static_cast<uint32_t>(e.bytes->size());
+    out.append(reinterpret_cast<const char *>(&len), 4);
+    out.append(reinterpret_cast<const char *>(e.bytes->data()), len);
   }
   return out;
 }
@@ -81,9 +88,9 @@ DiskCexCache::buildDiskKeyAndCanon(
 
 DiskCexCache::ParsedValue
 DiskCexCache::parseValue(const std::string &val) const {
-  if (val == "UNSAT")
+  if (val.empty())
     return {ValueKind::Unsat, ""};
-  if (val.size() > 9 && val.compare(0, 9, "SAT_DATA:") == 0)
+  if (static_cast<unsigned char>(val[0]) == 0x01)
     return {ValueKind::AssignmentData, val};
   return {ValueKind::Unknown, ""};
 }
@@ -100,37 +107,32 @@ DiskCexCache::parseAssignmentData(const std::string &data,
   for (const auto &[orig, can] : canon.forwardArrayMap)
     nameToOrig[can->name] = orig;
 
-  // Parse "SAT_DATA:A0=deadbeef;A1=0102;" entry by entry.
+  // Binary format: [0x01][n_arrays]([name_index][u32 data_len LE][bytes])×n
+  if (data.size() < 2) return nullptr;
+  uint8_t n_arrays = static_cast<uint8_t>(data[1]);
+
   std::vector<const Array *> objects;
   std::vector<std::vector<unsigned char>> values;
+  objects.reserve(n_arrays);
+  values.reserve(n_arrays);
 
-  size_t pos = 9; // skip "SAT_DATA:"
-  while (pos < data.size()) {
-    size_t eq = data.find('=', pos);
-    if (eq == std::string::npos)
-      break;
-    std::string name = data.substr(pos, eq - pos);
+  size_t pos = 2;
+  for (uint8_t i = 0; i < n_arrays; ++i) {
+    if (pos + 5 > data.size()) return nullptr; // need idx(1) + len(4)
+    uint8_t name_index = static_cast<uint8_t>(data[pos++]);
+    uint32_t data_len = 0;
+    memcpy(&data_len, &data[pos], 4); pos += 4;
+    if (pos + data_len > data.size()) return nullptr;
 
-    size_t semi = data.find(';', eq + 1);
-    if (semi == std::string::npos)
-      semi = data.size();
-    const std::string hexStr = data.substr(eq + 1, semi - eq - 1);
-
+    std::string name = "A" + std::to_string(name_index);
     auto nameIt = nameToOrig.find(name);
     if (nameIt != nameToOrig.end()) {
-      std::vector<unsigned char> bytes;
-      bytes.reserve(hexStr.size() / 2);
-      for (size_t i = 0; i + 1 < hexStr.size(); i += 2) {
-        int hi = hexNibble(hexStr[i]);
-        int lo = hexNibble(hexStr[i + 1]);
-        if (hi < 0 || lo < 0)
-          return nullptr; // malformed hex
-        bytes.push_back(static_cast<unsigned char>((hi << 4) | lo));
-      }
       objects.push_back(nameIt->second);
-      values.push_back(std::move(bytes));
+      values.emplace_back(
+          reinterpret_cast<const unsigned char *>(&data[pos]),
+          reinterpret_cast<const unsigned char *>(&data[pos]) + data_len);
     }
-    pos = semi + 1;
+    pos += data_len;
   }
 
   auto *a = new Assignment(objects, values);

@@ -48,6 +48,7 @@ private:
   void* mmap_base_ = nullptr;
   size_t file_size_ = 0;
   MapOfSetsFile header_file_;
+  std::vector<std::string> string_table_; // loaded once at open; indexed by key_index
   
   struct Chunk {
     uint64_t offset;
@@ -64,7 +65,7 @@ private:
   
   NodeChunk* get_chunk(uint32_t chunk_id);
   const Node& get_node(uint32_t node_id);
-  std::string deserialize_key(const std::string& key_bytes) const;
+  const std::string& key_str(uint32_t index) const; // look up string table
   std::string read_value(uint64_t offset) const;
   
   std::optional<std::string> lookup_rec(uint32_t node_id, 

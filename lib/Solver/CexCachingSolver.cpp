@@ -361,7 +361,7 @@ void CexCachingSolver::addToDiskWriteTree(const KeyType &key, Assignment *a) {
   }
 
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
-                        : "UNSAT";
+                        : ""; // empty = UNSAT sentinel in v2 binary format
   diskWriteTree_.insert(diskKey, value);
 }
 
