@@ -55,8 +55,9 @@ DiskCexCache::DiskCexCache(const std::string &filename,
 std::string DiskCexCache::serializeAssignment(
     const Assignment *a,
     const std::map<const Array *, const Array *> &forwardArrayMap) {
-  assert(forwardArrayMap.size() <= 255 &&
-         "serializeAssignment: too many symbolic arrays for binary format (max 255)");
+  if (forwardArrayMap.size() > 255)
+    klee_error("serializeAssignment: too many symbolic arrays (%zu) for "
+               "binary format (max 255)", forwardArrayMap.size());
 
   struct Entry { uint8_t idx; const std::vector<unsigned char> *bytes; };
   std::vector<Entry> entries;

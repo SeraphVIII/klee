@@ -69,6 +69,14 @@ cl::opt<std::string> WriteDiskCexCacheFile(
     cl::init(""),
     cl::cat(SolvingCat));
 
+cl::opt<std::string> PersistentCexCacheFile(
+    "persistent-cex-cache",
+    cl::desc("Path to a persistent CEX cache file: read on startup and "
+             "updated on exit (shorthand for --disk-cex-cache=X "
+             "--write-disk-cex-cache=X with the same path)"),
+    cl::init(""),
+    cl::cat(SolvingCat));
+
 cl::opt<bool> DebugCexCacheCheckBinding(
     "debug-cex-cache-check-binding", cl::init(false),
     cl::desc("Debug the correctness of the counterexample "
@@ -114,10 +122,11 @@ class CexCachingSolver : public SolverImpl {
 
   // Write-back: pre-serialized tree built incrementally at insert time so
   // that canonicalization runs while all Array objects are still alive.
-  // Only populated when --write-disk-cex-cache is set.
+  // Only populated when --write-disk-cex-cache or --persistent-cex-cache is set.
   MapOfSetsDiskBuilder::UBTree diskWriteTree_;
   ArrayCache diskWriteArrayCache_;
   std::unique_ptr<ExprBuilder> diskWriteBuilder_;
+  std::string diskWritePath_; // resolved write destination (empty = disabled)
 
   void addToDiskWriteTree(const KeyType &key, Assignment *a);
 
@@ -297,6 +306,7 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 
   std::vector< std::vector<unsigned char> > values;
   bool hasSolution;
+  
   if (!solver->impl->computeInitialValues(query, objects, values, 
                                           hasSolution))
     return false;
@@ -335,17 +345,26 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 ///
 CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     : solver(std::move(solver)) {
-  if (!DiskCexCacheFile.empty())
-    diskCexCache_ = std::make_unique<DiskCexCache>(DiskCexCacheFile.getValue(),
-                                                   buildCacheMetadata());
-  if (!WriteDiskCexCacheFile.empty())
+  // --persistent-cex-cache is shorthand for setting both read and write to
+  // the same file.  Explicit --disk-cex-cache / --write-disk-cex-cache take
+  // precedence if provided alongside it.
+  const std::string readPath = !DiskCexCacheFile.empty()
+                                   ? DiskCexCacheFile.getValue()
+                                   : PersistentCexCacheFile.getValue();
+  diskWritePath_ = !WriteDiskCexCacheFile.empty()
+                       ? WriteDiskCexCacheFile.getValue()
+                       : PersistentCexCacheFile.getValue();
+
+  if (!readPath.empty())
+    diskCexCache_ = std::make_unique<DiskCexCache>(readPath, buildCacheMetadata());
+  if (!diskWritePath_.empty())
     diskWriteBuilder_.reset(createDefaultExprBuilder());
 }
 
 
 CexCachingSolver::~CexCachingSolver() {
   if (diskWriteBuilder_) {
-    const std::string &path = WriteDiskCexCacheFile.getValue();
+    const std::string &path = diskWritePath_;
 
     // Merge existing cache file entries that are not already in diskWriteTree_
     // (new entries from this run take precedence). This is done at exit rather

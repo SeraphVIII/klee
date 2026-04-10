@@ -1,6 +1,7 @@
 #include "klee/Solver/MapOfSetsDiskBuilder.h"
 #include "klee/Support/ErrorHandling.h"
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <set>
@@ -175,31 +176,49 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   uint64_t strOffset  = valOffset + valuesBlob.size();
   uint64_t chunkStart = strOffset + stringTableBlob.size();
 
-  // 7. Write file.
-  std::ofstream out(filename, std::ios::binary);
-  if (!out) {
-    klee_warning("MapOfSetsDiskBuilder: cannot create '%s'", filename.c_str());
-    return;
-  }
+  // 7. Write file atomically: write to a temp path, then rename into place.
+  // rename() is atomic on POSIX — the destination is never partially written.
+  std::string tmpPath = filename + ".tmp";
+  {
+    std::ofstream out(tmpPath, std::ios::binary);
+    if (!out) {
+      klee_warning("MapOfSetsDiskBuilder: cannot create '%s'", tmpPath.c_str());
+      return;
+    }
 
-  // Preamble
-  out.write(reinterpret_cast<const char *>(&kRawMagic), sizeof(uint64_t));
-  out.write(reinterpret_cast<const char *>(&headerSize), sizeof(uint64_t));
-  // Header protobuf
-  out.write(finalHeaderBlob.data(), finalHeaderBlob.size());
-  // Directory: (u64 offset, u32 size) per chunk
-  uint64_t curChunkOffset = chunkStart;
-  for (const auto &buf : chunkBuffers) {
-    out.write(reinterpret_cast<const char *>(&curChunkOffset), sizeof(uint64_t));
-    uint32_t sz = static_cast<uint32_t>(buf.size());
-    out.write(reinterpret_cast<const char *>(&sz), sizeof(uint32_t));
-    curChunkOffset += sz;
+    // Preamble
+    out.write(reinterpret_cast<const char *>(&kRawMagic), sizeof(uint64_t));
+    out.write(reinterpret_cast<const char *>(&headerSize), sizeof(uint64_t));
+    // Header protobuf
+    out.write(finalHeaderBlob.data(), finalHeaderBlob.size());
+    // Directory: (u64 offset, u32 size) per chunk
+    uint64_t curChunkOffset = chunkStart;
+    for (const auto &buf : chunkBuffers) {
+      out.write(reinterpret_cast<const char *>(&curChunkOffset), sizeof(uint64_t));
+      uint32_t sz = static_cast<uint32_t>(buf.size());
+      out.write(reinterpret_cast<const char *>(&sz), sizeof(uint32_t));
+      curChunkOffset += sz;
+    }
+    // Values blob
+    out.write(valuesBlob.data(), valuesBlob.size());
+    // String table
+    out.write(stringTableBlob.data(), stringTableBlob.size());
+    // Chunk protobufs
+    for (const auto &buf : chunkBuffers)
+      out.write(buf.data(), buf.size());
+
+    if (out.fail()) {
+      klee_warning("MapOfSetsDiskBuilder: write error for '%s' (disk full?)",
+                   tmpPath.c_str());
+      out.close();
+      std::remove(tmpPath.c_str());
+      return;
+    }
+  } // ofstream flushed and closed by destructor
+
+  if (std::rename(tmpPath.c_str(), filename.c_str()) != 0) {
+    klee_warning("MapOfSetsDiskBuilder: rename '%s' -> '%s' failed",
+                 tmpPath.c_str(), filename.c_str());
+    std::remove(tmpPath.c_str());
   }
-  // Values blob
-  out.write(valuesBlob.data(), valuesBlob.size());
-  // String table
-  out.write(stringTableBlob.data(), stringTableBlob.size());
-  // Chunk protobufs
-  for (const auto &buf : chunkBuffers)
-    out.write(buf.data(), buf.size());
 }

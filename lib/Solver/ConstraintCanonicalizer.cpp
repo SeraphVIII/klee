@@ -6,7 +6,6 @@
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/SHA1.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -369,36 +368,6 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   return res;
-}
-
-std::string serializeCanonicalConstraints(
-    const std::vector<ref<Expr>> &canonConstraints) {
-  std::string out;
-  llvm::raw_string_ostream os(out);
-
-  for (auto &e : canonConstraints) {
-    ExprPPrinter::printSingleExpr(os, e);
-    os << '\n';
-  }
-  os.flush();
-  return out;
-}
-
-std::string computeCanonicalKey(
-    const std::vector<ref<Expr>> &canonConstraints) {
-  std::string buf = serializeCanonicalConstraints(canonConstraints);
-
-  llvm::SHA1 hash;
-  hash.update(buf);
-  auto digest = hash.final();
-
-  std::string hex;
-  hex.reserve(digest.size() * 2);
-  for (uint8_t b : digest) {
-    hex.push_back("0123456789abcdef"[b >> 4]);
-    hex.push_back("0123456789abcdef"[b & 0xf]);
-  }
-  return hex;
 }
 
 std::pair<std::set<std::string>, CanonicalizationResult>

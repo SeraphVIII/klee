@@ -35,14 +35,6 @@ canonicalizeConstraintSet(const std::vector<klee::ref<Expr>> &constraints,
                           ExprBuilder &builder,
                           ArrayCache &arrayCache);
 
-/// Deterministic textual serialization of canonicalized constraints.
-std::string serializeCanonicalConstraints(
-    const std::vector<klee::ref<Expr>> &canonConstraints);
-
-/// Compute a stable key (e.g. SHA-1 hex) for a canonical constraint list.
-std::string computeCanonicalKey(
-    const std::vector<klee::ref<Expr>> &canonConstraints);
-
 /// Build the disk lookup key (set of printed canonical constraint strings) and
 /// the full CanonicalizationResult in a single pass.  Both the read path
 /// (DiskCexCache) and the write path (CexCachingSolver) use identical key

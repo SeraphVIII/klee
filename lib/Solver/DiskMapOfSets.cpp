@@ -26,7 +26,7 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   if (fd_ < 0) { fail("DiskMapOfSets: cannot open"); return; }
 
   struct stat st;
-  fstat(fd_, &st);
+  if (fstat(fd_, &st) != 0) { fail("DiskMapOfSets: fstat failed on"); return; }
   file_size_ = st.st_size;
   if (file_size_ == 0) { fail("DiskMapOfSets: file is empty"); return; }
 
