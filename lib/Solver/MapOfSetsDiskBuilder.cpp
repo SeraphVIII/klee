@@ -64,7 +64,6 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   for (uint32_t i = 0; i < static_cast<uint32_t>(strings.size()); ++i)
     stringIndex[strings[i]] = i;
 
-  // Serialise: [u32 count]([u32 len][bytes])×count
   std::string stringTableBlob;
   uint32_t strCount = static_cast<uint32_t>(strings.size());
   stringTableBlob.append(reinterpret_cast<const char *>(&strCount), 4);

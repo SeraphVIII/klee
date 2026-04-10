@@ -57,12 +57,8 @@ bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
 
 namespace {
 
-///===----------------------------------------------------------------------===//
-/// Collects Arrays in deterministic DFS order, assigning each a position
-/// index based on first appearance. This order is used to generate stable
-/// canonical names (A0, A1, A2, ...) independent of original array names
-/// or allocation order.
-///===----------------------------------------------------------------------===//
+// Assigns each Array a DFS first-appearance index for stable canonical names
+// (A0, A1, ...), independent of original array names or allocation order.
 class ArrayOrderCollector : public ExprVisitor {
   std::unordered_map<const Array *, unsigned> &order_;
   unsigned &nextIndex_;
@@ -86,14 +82,8 @@ public:
   }
 };
 
-///===----------------------------------------------------------------------===//
-/// Rewrites every ReadExpr whose root Array appears in subst_, replacing it
-/// with the corresponding canonical Array. Also walks the full UpdateList
-/// chain so that symbolic writes (array updates) are substituted correctly.
-///
-/// subst_ is the forwardArrayMap from CanonicalizationResult:
-///   original Array*  -->  canonical Array*  (e.g. arr_foo --> A2)
-///===----------------------------------------------------------------------===//
+// Rewrites ReadExprs to use canonical arrays (from forwardArrayMap / subst_),
+// including walking UpdateList chains so symbolic writes are substituted too.
 class ArraySubstitutionVisitor : public ExprVisitor {
   const std::map<const Array *, const Array *> &subst_;
 
@@ -106,24 +96,14 @@ public:
     const UpdateList &ul = re.updates;
     const Array *root = ul.root;
 
-    // Fast path: no update chain and root not substituted.
-    // The ExprVisitor framework handles index recursion via doChildren(),
-    // rebuilding the ReadExpr only if the index sub-expression changes.
+    // Fast path: no substitution needed, let ExprVisitor handle the index.
     auto it = subst_.find(root);
     if (it == subst_.end() && !ul.head)
       return Action::doChildren();
 
-    // Look up the root array. If it isn't in subst_ we still need to
-    // rebuild if the update chain contains expressions that reference
-    // other arrays that *are* in subst_.
     const Array *newRoot = (it != subst_.end()) ? it->second : root;
 
-    // Rebuild the update chain oldest-first (head is most recent write,
-    // so we collect into a vector and replay in reverse).
-    //
-    // Example: if the chain is  [write idx2 val2] -> [write idx1 val1] -> nil
-    // we want to replay write idx1 first, then write idx2, so the rebuilt
-    // chain has the same logical meaning.
+    // Replay the update chain oldest-first (head is newest, so reverse it).
     std::vector<ref<UpdateNode>> nodes;
     for (ref<UpdateNode> un = ul.head; un; un = un->next)
       nodes.push_back(un);
@@ -131,8 +111,6 @@ public:
     UpdateList newUL(newRoot, nullptr);
     for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit) {
       ref<UpdateNode> un = *rit;
-      // visit() recursively applies this substitution to sub-expressions,
-      // so any nested array reads inside the index/value are also renamed.
       ref<Expr> newIdx = visit(un->index);
       ref<Expr> newVal = visit(un->value);
       newUL.extend(newIdx, newVal);

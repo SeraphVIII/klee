@@ -77,6 +77,18 @@ cl::opt<std::string> PersistentCexCacheFile(
     cl::init(""),
     cl::cat(SolvingCat));
 
+// Minimum number of disk-cache lookups that must occur before the hit-rate
+// check fires.  During this warm-up period the disk cache is always consulted.
+static constexpr unsigned kDiskCacheWarmupLookups = 50;
+
+cl::opt<unsigned> DiskCacheMinHitRatePct(
+    "disk-cex-cache-min-hit-rate",
+    cl::desc("Disable the disk CEX cache for the rest of the run once at least "
+             "50 lookups have been made and the hit rate falls below this "
+             "percentage (0 = never disable, default = 10)"),
+    cl::init(10),
+    cl::cat(SolvingCat));
+
 cl::opt<bool> DebugCexCacheCheckBinding(
     "debug-cex-cache-check-binding", cl::init(false),
     cl::desc("Debug the correctness of the counterexample "
@@ -119,6 +131,11 @@ class CexCachingSolver : public SolverImpl {
 
   // Disk cache support
   std::unique_ptr<DiskCexCache> diskCexCache_;
+
+  // Hit-rate early-exit: disable disk cache if hit rate is too low after warmup.
+  uint64_t diskCacheLookups_ = 0;
+  uint64_t diskCacheHitCount_ = 0;
+  bool diskCacheGivenUp_ = false;
 
   // Write-back: pre-serialized tree built incrementally at insert time so
   // that canonicalization runs while all Array objects are still alive.
@@ -243,14 +260,28 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
     }
   }
 
-  if (diskCexCache_) {
+  if (diskCexCache_ && !diskCacheGivenUp_) {
     Assignment *diskResult = nullptr;
+    ++diskCacheLookups_;
     if (diskCexCache_->find(key, CexCacheSuperSet, diskResult)) {
+      ++diskCacheHitCount_;
       ++stats::queryCexDiskCacheHits;
       result = diskResult;
       return true;
     }
     ++stats::queryCexDiskCacheMisses;
+
+    // After the warm-up window, disable if hit rate is below the threshold.
+    if (DiskCacheMinHitRatePct > 0 &&
+        diskCacheLookups_ >= kDiskCacheWarmupLookups &&
+        diskCacheHitCount_ * 100 < diskCacheLookups_ * DiskCacheMinHitRatePct) {
+      diskCacheGivenUp_ = true;
+      klee_warning("DiskCexCache: hit rate %.1f%% after %llu lookups — "
+                   "disabling for this run (threshold %u%%)",
+                   diskCacheHitCount_ * 100.0 / diskCacheLookups_,
+                   (unsigned long long)diskCacheLookups_,
+                   DiskCacheMinHitRatePct.getValue());
+    }
   }
 
   return false;
@@ -290,12 +321,8 @@ bool CexCachingSolver::lookupAssignment(const Query &query,
 bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
   KeyType key;
   if (lookupAssignment(query, key, result)) {
-    // If the hit came from the disk cache the result is not yet in the
-    // in-memory MapOfSets.  Insert it now so that subsequent identical
-    // queries short-circuit without another (expensive) disk lookup.
-    // Disk-owned Assignment objects are safe to store here because
-    // diskCexCache_ outlives cache; we do NOT add them to assignmentsTable
-    // since that set deletes its contents in the destructor.
+    // Promote disk hits into the in-memory cache to avoid repeated disk lookups.
+    // Do NOT add to assignmentsTable — that set owns and deletes its entries.
     if (diskCexCache_ && !cache.lookup(key))
       cache.insert(key, result);
     return true;

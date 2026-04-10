@@ -20,19 +20,10 @@
 namespace klee {
 
 /// Read-only CEX cache backed by DiskMapOfSets.
-///
-/// Values on disk use binary v2 format (see DiskCexCache::serializeAssignment):
-///   SAT:   [u8 0x01][u8 n_arrays]([u8 name_idx][u32 data_len][bytes])×n
-///   UNSAT: empty string (zero bytes)
-///
-/// Keys are produced by canonicalizeConstraintSet() followed by
-/// ExprPPrinter::printSingleExpr() (no trailing newline) for each constraint.
 class DiskCexCache {
 public:
-  /// Serialize a SAT assignment to the "SAT_DATA:..." disk format.
+  /// Serialize a SAT assignment to the binary v2 disk format.
   /// forwardArrayMap maps original Array* -> canonical Array* (A0, A1, ...).
-  /// This is the inverse of what is needed for reading; it is exposed here
-  /// so that the future write path in CexCachingSolver can call it directly.
   static std::string
   serializeAssignment(const Assignment *a,
                       const std::map<const Array *, const Array *> &forwardArrayMap);
@@ -81,11 +72,7 @@ private:
 
   ParsedValue parseValue(const std::string &val) const;
 
-  /// Deserialize a binary assignment from `data` into an Assignment whose
-  /// bindings reference the original arrays via `nameToOrig`
-  /// (canonical name -> original Array*).
-  /// Returns nullptr on parse failure. The returned pointer is owned by
-  /// ownedAssignments_ and remains valid for the lifetime of this object.
+  /// Returns nullptr on parse failure; on success owned by ownedAssignments_.
   Assignment *parseAssignmentData(
       const std::string &data,
       const std::map<std::string, const Array *> &nameToOrig);
