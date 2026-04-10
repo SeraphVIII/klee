@@ -280,8 +280,17 @@ bool CexCachingSolver::lookupAssignment(const Query &query,
 
 bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
   KeyType key;
-  if (lookupAssignment(query, key, result))
+  if (lookupAssignment(query, key, result)) {
+    // If the hit came from the disk cache the result is not yet in the
+    // in-memory MapOfSets.  Insert it now so that subsequent identical
+    // queries short-circuit without another (expensive) disk lookup.
+    // Disk-owned Assignment objects are safe to store here because
+    // diskCexCache_ outlives cache; we do NOT add them to assignmentsTable
+    // since that set deletes its contents in the destructor.
+    if (diskCexCache_ && !cache.lookup(key))
+      cache.insert(key, result);
     return true;
+  }
 
   std::vector<const Array*> objects;
   findSymbolicObjects(key.begin(), key.end(), objects);
@@ -343,14 +352,14 @@ CexCachingSolver::~CexCachingSolver() {
     // than at startup so that diskWriteTree_ stays small during the KLEE run.
     mapofsets::DiskMapOfSets existing(path);
     if (existing.isValid()) {
-      auto entries = existing.allEntries();
       size_t merged = 0;
-      for (auto &e : entries) {
-        if (!diskWriteTree_.lookup(e.key_set)) {
-          diskWriteTree_.insert(e.key_set, e.value);
+      existing.forEach([&](const std::set<std::string> &keySet,
+                           const std::string &val) {
+        if (!diskWriteTree_.lookup(keySet)) {
+          diskWriteTree_.insert(keySet, val);
           ++merged;
         }
-      }
+      });
       if (merged)
         klee_message("Merged %zu existing entries from disk CEX cache %s",
                      merged, path.c_str());

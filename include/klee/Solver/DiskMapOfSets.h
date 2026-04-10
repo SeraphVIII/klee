@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <functional>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -37,11 +38,17 @@ public:
   // Exact lookup
   std::optional<std::string> lookup(const std::set<std::string>& query_set);
   
-  // All subsets of query_set
-  std::vector<Entry> subsets(const std::set<std::string>& query_set);
+  // Values of all subsets of query_set (key sets not returned; callers only
+  // need the stored values, avoiding the cost of rebuilding key sets).
+  std::vector<std::string> subsets(const std::set<std::string>& query_set);
 
-  // All supersets of query_set
-  std::vector<Entry> supersets(const std::set<std::string>& query_set);
+  // Values of all supersets of query_set (same rationale as subsets above).
+  std::vector<std::string> supersets(const std::set<std::string>& query_set);
+
+  // Stream every entry in the trie without materialising them all at once.
+  // The callback receives (key_set, value) for each stored entry.
+  // Used for merge-on-write; avoids a peak allocation proportional to cache size.
+  void forEach(std::function<void(const std::set<std::string>&, const std::string&)> cb);
 
   // All entries in the trie (full traversal). Used for merge-on-write.
   std::vector<Entry> allEntries();
@@ -76,18 +83,21 @@ private:
                                         std::set<std::string>::const_iterator q_begin,
                                         std::set<std::string>::const_iterator q_end);
   
-  void find_subsets(uint32_t node_id, std::set<std::string> &accum,
+  // Query traversals: no accum — callers only need values, not key sets.
+  void find_subsets(uint32_t node_id,
                     std::set<std::string>::const_iterator q_begin,
                     std::set<std::string>::const_iterator q_end,
-                    std::vector<Entry>& results);
-  
-  void find_supersets(uint32_t node_id, std::set<std::string> &accum,
+                    std::vector<std::string>& results);
+
+  void find_supersets(uint32_t node_id,
                       std::set<std::string>::const_iterator q_begin,
                       std::set<std::string>::const_iterator q_end,
-                      std::vector<Entry>& results);
+                      std::vector<std::string>& results);
 
+  // Full traversal with callback; accum tracks the current path for key_set.
   void enumerate_all(uint32_t node_id, std::set<std::string> &accum,
-                     std::vector<Entry> &results);
+                     const std::function<void(const std::set<std::string>&,
+                                              const std::string&)> &cb);
 };
 
 }} // namespace klee::mapofsets

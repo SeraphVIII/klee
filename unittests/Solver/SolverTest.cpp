@@ -198,9 +198,7 @@ TEST(DiskMapOfSetsTest, RoundTrip) {
   {
     auto supers = disk.supersets({"a"});
     ASSERT_EQ(3u, supers.size());
-    std::set<std::string> values;
-    for (const auto &e : supers)
-      values.insert(e.value);
+    std::set<std::string> values(supers.begin(), supers.end());
     EXPECT_TRUE(values.count("UNSAT"));
     EXPECT_TRUE(values.count("SAT:1"));
     EXPECT_TRUE(values.count("SAT:2"));
@@ -208,19 +206,10 @@ TEST(DiskMapOfSetsTest, RoundTrip) {
   }
 
   // subsets({"a","b","c"}) → {"a"}, {"a","b"}, {"a","c"}
-  // Under new code find_subsets returns ALL entries (SAT and UNSAT).
   {
     auto subs = disk.subsets({"a", "b", "c"});
     ASSERT_EQ(3u, subs.size());
-    std::set<std::set<std::string>> gotKeys;
-    std::set<std::string> gotValues;
-    for (const auto &e : subs) {
-      gotKeys.insert(e.key_set);
-      gotValues.insert(e.value);
-    }
-    EXPECT_TRUE(gotKeys.count({"a"}));
-    EXPECT_TRUE(gotKeys.count({"a", "b"}));
-    EXPECT_TRUE(gotKeys.count({"a", "c"}));
+    std::set<std::string> gotValues(subs.begin(), subs.end());
     EXPECT_TRUE(gotValues.count("UNSAT"));
     EXPECT_TRUE(gotValues.count("SAT:1"));
     EXPECT_TRUE(gotValues.count("SAT:2"));
@@ -236,8 +225,7 @@ TEST(DiskMapOfSetsTest, RoundTrip) {
   {
     auto subs = disk.subsets({"x", "y"});
     ASSERT_EQ(1u, subs.size()); // only {"x"} -> "SAT:42"
-    EXPECT_EQ(std::set<std::string>{"x"}, subs[0].key_set);
-    EXPECT_EQ("SAT:42", subs[0].value);
+    EXPECT_EQ("SAT:42", subs[0]);
   }
 
   std::remove(testFile.c_str());
@@ -268,9 +256,7 @@ TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
   {
     auto supers = disk.supersets({"a"});
     ASSERT_EQ(3u, supers.size());
-    std::set<std::string> values;
-    for (const auto &e : supers)
-      values.insert(e.value);
+    std::set<std::string> values(supers.begin(), supers.end());
     EXPECT_TRUE(values.count("UNSAT_a"));
     EXPECT_TRUE(values.count("UNSAT_ab"));
     EXPECT_TRUE(values.count("SAT_abc"));
@@ -278,21 +264,11 @@ TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
   }
 
   // subsets({"a","b","c"}) → {}, {"a"}, {"a","b"}, {"a","b","c"}
-  // find_subsets now returns ALL entries including SAT.
   // The set itself is also a subset of itself.
   {
     auto subs = disk.subsets({"a", "b", "c"});
     ASSERT_EQ(4u, subs.size());
-    std::set<std::set<std::string>> gotKeys;
-    std::set<std::string> gotValues;
-    for (const auto &e : subs) {
-      gotKeys.insert(e.key_set);
-      gotValues.insert(e.value);
-    }
-    EXPECT_TRUE(gotKeys.count({}));
-    EXPECT_TRUE(gotKeys.count({"a"}));
-    EXPECT_TRUE(gotKeys.count({"a", "b"}));
-    EXPECT_TRUE(gotKeys.count({"a", "b", "c"}));
+    std::set<std::string> gotValues(subs.begin(), subs.end());
     // Mix of UNSAT and SAT
     EXPECT_TRUE(gotValues.count("UNSAT_root"));
     EXPECT_TRUE(gotValues.count("UNSAT_a"));
@@ -304,12 +280,10 @@ TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
   {
     auto subs = disk.subsets({"x", "y"});
     ASSERT_EQ(3u, subs.size());
-    std::set<std::set<std::string>> gotKeys;
-    for (const auto &e : subs)
-      gotKeys.insert(e.key_set);
-    EXPECT_TRUE(gotKeys.count({}));
-    EXPECT_TRUE(gotKeys.count({"x"}));
-    EXPECT_TRUE(gotKeys.count({"x", "y"}));
+    std::set<std::string> gotValues(subs.begin(), subs.end());
+    EXPECT_TRUE(gotValues.count("UNSAT_root"));
+    EXPECT_TRUE(gotValues.count("SAT_x"));
+    EXPECT_TRUE(gotValues.count("SAT_xy"));
   }
 
   // supersets({}) → everything in the map
@@ -323,11 +297,9 @@ TEST(DiskMapOfSetsTest, ComplexRoundTrip) {
     auto subs = disk.subsets({"a", "z"});
     // Only {} and {"a"} are subsets — {"a","z"} not in map, {"z"} not in map
     ASSERT_EQ(2u, subs.size());
-    std::set<std::set<std::string>> gotKeys;
-    for (const auto &e : subs)
-      gotKeys.insert(e.key_set);
-    EXPECT_TRUE(gotKeys.count({}));
-    EXPECT_TRUE(gotKeys.count({"a"}));
+    std::set<std::string> gotValues(subs.begin(), subs.end());
+    EXPECT_TRUE(gotValues.count("UNSAT_root"));
+    EXPECT_TRUE(gotValues.count("UNSAT_a"));
   }
 
   // Miss
@@ -354,22 +326,18 @@ TEST(DiskMapOfSetsTest, SupersetBacktracking) {
   {
     auto supers = disk.supersets({"c"});
     ASSERT_EQ(3u, supers.size());
-    std::set<std::string> values;
-    for (const auto &e : supers)
-      values.insert(e.value);
+    std::set<std::string> values(supers.begin(), supers.end());
     EXPECT_TRUE(values.count("SAT_bc"));
     EXPECT_TRUE(values.count("SAT_c"));
     EXPECT_TRUE(values.count("SAT_cd"));
   }
 
-  // Every returned key_set must contain "c" — this is what actually
-  // exercises the backtracking correctness: accum must not be corrupted
-  // when "b" is inserted and erased before we find "c".
+  // Backtracking correctness: all three supersets of {"c"} must be found.
+  // Returning the wrong count (< 3) would indicate accum corruption.
   {
     auto supers = disk.supersets({"c"});
-    for (const auto &e : supers)
-      EXPECT_TRUE(e.key_set.count("c"))
-          << "key_set missing 'c': accum was corrupted by backtracking";
+    EXPECT_EQ(3u, supers.size())
+        << "Wrong superset count — backtracking may have corrupted traversal";
   }
 
   // Sanity: {"b"} alone is not in the map and {"b"} is not a superset of {"c"}
@@ -395,7 +363,7 @@ TEST(DiskMapOfSetsTest, EmptySetEdgeCases) {
   {
     auto subs = disk.subsets({});
     ASSERT_EQ(1u, subs.size());
-    EXPECT_TRUE(subs[0].key_set.empty());
+    EXPECT_EQ("UNSAT_empty", subs[0]);
   }
 
   // supersets({}) → everything

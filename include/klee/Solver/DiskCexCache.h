@@ -90,9 +90,13 @@ private:
       const std::string &data,
       const std::map<std::string, const Array *> &nameToOrig);
 
-  bool pickEntry(const std::vector<mapofsets::DiskMapOfSets::Entry> &entries,
+  // unsatValid: true when values come from subset queries (an UNSAT subset
+  // proves the full set UNSAT); false for superset queries (an UNSAT superset
+  // says nothing about the subset — only SAT superset assignments are usable).
+  bool pickEntry(const std::vector<std::string> &values,
                  const CanonicalizationResult &canon,
                  const std::set<ref<Expr>> &originalConstraints,
+                 bool unsatValid,
                  Assignment *&outAssignment);
 };
 

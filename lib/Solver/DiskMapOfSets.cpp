@@ -232,25 +232,24 @@ std::optional<std::string> DiskMapOfSets::lookup_rec(
   return lookup_rec(it->child_id(), std::next(q_begin), q_end);
 }
 
-std::vector<DiskMapOfSets::Entry>
+std::vector<std::string>
 DiskMapOfSets::subsets(const std::set<std::string> &query_set) {
   if (!valid_) return {};
-  std::vector<Entry> results;
-  std::set<std::string> accum;
-  find_subsets(header_file_.header().root_id(), accum,
+  std::vector<std::string> results;
+  find_subsets(header_file_.header().root_id(),
                query_set.begin(), query_set.end(), results);
   return results;
 }
 
 void DiskMapOfSets::find_subsets(
-    uint32_t node_id, std::set<std::string> &accum,
+    uint32_t node_id,
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
-    std::vector<Entry> &results) {
+    std::vector<std::string> &results) {
   const auto &node = get_node(node_id);
 
   if (node.is_end_of_set())
-    results.push_back(Entry{accum, read_value(node.value_offset())});
+    results.push_back(read_value(node.value_offset()));
 
   for (auto q_it = q_begin; q_it != q_end; ++q_it) {
     const std::string &elt = *q_it;
@@ -263,42 +262,34 @@ void DiskMapOfSets::find_subsets(
 
     if (child_it != node.children().end() &&
         key_str(child_it->key_index()) == elt) {
-      accum.insert(elt);
-      find_subsets(child_it->child_id(), accum, std::next(q_it), q_end, results);
-      accum.erase(elt);
+      find_subsets(child_it->child_id(), std::next(q_it), q_end, results);
     }
   }
 }
 
-std::vector<DiskMapOfSets::Entry>
+std::vector<std::string>
 DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
   if (!valid_) return {};
-  std::vector<Entry> results;
-  std::set<std::string> accum;
-  find_supersets(header_file_.header().root_id(), accum,
+  std::vector<std::string> results;
+  find_supersets(header_file_.header().root_id(),
                  query_set.begin(), query_set.end(), results);
   return results;
 }
 
 void DiskMapOfSets::find_supersets(
-    uint32_t node_id, std::set<std::string> &accum,
+    uint32_t node_id,
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
-    std::vector<Entry> &results) {
+    std::vector<std::string> &results) {
   const auto &node = get_node(node_id);
 
   if (q_begin == q_end) {
-    // All query elements have been matched: any path from here to an
-    // end-of-set node is a valid superset, so enumerate everything below.
+    // All query elements matched: any path to an end-of-set node is a superset.
     if (node.is_end_of_set())
-      results.push_back(Entry{accum, read_value(node.value_offset())});
+      results.push_back(read_value(node.value_offset()));
 
-    for (const auto &child : node.children()) {
-      const std::string &child_key = key_str(child.key_index());
-      accum.insert(child_key);
-      find_supersets(child.child_id(), accum, q_begin, q_end, results);
-      accum.erase(child_key);
-    }
+    for (const auto &child : node.children())
+      find_supersets(child.child_id(), q_begin, q_end, results);
   } else {
     // Still have query elements to match.  Children and query are both sorted.
     const std::string &elt = *q_begin;
@@ -306,48 +297,50 @@ void DiskMapOfSets::find_supersets(
 
     for (const auto &child : node.children()) {
       const std::string &child_key = key_str(child.key_index());
-      accum.insert(child_key);
 
       if (child_key == elt) {
         // This edge matches the current query element; advance the query.
-        find_supersets(child.child_id(), accum, next_q, q_end, results);
+        find_supersets(child.child_id(), next_q, q_end, results);
       } else if (child_key < elt) {
-        // This edge is a superset-only element that sorts before elt.  The
-        // superset may contain arbitrary extra elements, so follow this child
-        // without advancing the query — elt may still appear further down.
-        find_supersets(child.child_id(), accum, q_begin, q_end, results);
+        // Extra superset element before elt: follow without advancing the query.
+        find_supersets(child.child_id(), q_begin, q_end, results);
       } else {
-        // child_key > elt: since children are sorted and only increase along
-        // this level, elt can never be matched by any remaining child.  No
-        // superset is reachable from here; stop scanning.
-        accum.erase(child_key);
+        // child_key > elt: elt can never be matched by remaining children.
         break;
       }
-
-      accum.erase(child_key);
     }
   }
 }
 
-void DiskMapOfSets::enumerate_all(uint32_t node_id,
-                                  std::set<std::string> &accum,
-                                  std::vector<Entry> &results) {
+void DiskMapOfSets::enumerate_all(
+    uint32_t node_id,
+    std::set<std::string> &accum,
+    const std::function<void(const std::set<std::string>&,
+                             const std::string&)> &cb) {
   const auto &node = get_node(node_id);
   if (node.is_end_of_set())
-    results.push_back(Entry{accum, read_value(node.value_offset())});
+    cb(accum, read_value(node.value_offset()));
 
   for (const auto &child : node.children()) {
     const std::string &key = key_str(child.key_index());
     accum.insert(key);
-    enumerate_all(child.child_id(), accum, results);
+    enumerate_all(child.child_id(), accum, cb);
     accum.erase(key);
   }
+}
+
+void DiskMapOfSets::forEach(
+    std::function<void(const std::set<std::string>&, const std::string&)> cb) {
+  if (!valid_) return;
+  std::set<std::string> accum;
+  enumerate_all(header_file_.header().root_id(), accum, cb);
 }
 
 std::vector<DiskMapOfSets::Entry> DiskMapOfSets::allEntries() {
   if (!valid_) return {};
   std::vector<Entry> results;
-  std::set<std::string> accum;
-  enumerate_all(header_file_.header().root_id(), accum, results);
+  forEach([&](const std::set<std::string> &ks, const std::string &v) {
+    results.push_back({ks, v});
+  });
   return results;
 }

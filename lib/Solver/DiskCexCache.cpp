@@ -148,23 +148,28 @@ DiskCexCache::parseAssignmentData(
 // ---------------------------------------------------------------------------
 
 bool DiskCexCache::pickEntry(
-    const std::vector<DiskMapOfSets::Entry> &entries,
+    const std::vector<std::string> &values,
     const CanonicalizationResult &canon,
     const std::set<ref<Expr>> &originalConstraints,
+    bool unsatValid,
     Assignment *&outAssignment) {
-  // Build canonical_name -> original Array* once for all entries in this call;
-  // all entries share the same CanonicalizationResult.
+  // Build canonical_name -> original Array* once for all values in this call;
+  // all values share the same CanonicalizationResult.
   std::map<std::string, const Array *> nameToOrig;
   for (const auto &[orig, can] : canon.forwardArrayMap)
     nameToOrig[can->name] = orig;
 
-  for (const auto &e : entries) {
-    ParsedValue pv = parseValue(e.value);
+  for (const auto &val : values) {
+    ParsedValue pv = parseValue(val);
     switch (pv.kind) {
     case ValueKind::Unsat:
-      // Any UNSAT subset proves the full set UNSAT.
-      outAssignment = nullptr;
-      return true;
+      // An UNSAT subset proves the full set UNSAT; an UNSAT superset does not
+      // (the query has fewer constraints and may still be satisfiable).
+      if (unsatValid) {
+        outAssignment = nullptr;
+        return true;
+      }
+      break;
     case ValueKind::AssignmentData: {
       Assignment *a = parseAssignmentData(pv.satData, nameToOrig);
       if (a && a->satisfies(originalConstraints.begin(),
@@ -195,11 +200,11 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
   auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   if (trySuperset) {
     auto supers = disk_.supersets(diskKey);
-    if (pickEntry(supers, canon, constraints, outAssignment))
+    if (pickEntry(supers, canon, constraints, /*unsatValid=*/false, outAssignment))
       return true;
   }
   auto subs = disk_.subsets(diskKey);
-  return pickEntry(subs, canon, constraints, outAssignment);
+  return pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
 }
 
 bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
@@ -209,7 +214,7 @@ bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
   auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   auto supers = disk_.supersets(diskKey);
-  return pickEntry(supers, canon, constraints, outAssignment);
+  return pickEntry(supers, canon, constraints, /*unsatValid=*/false, outAssignment);
 }
 
 bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
@@ -219,5 +224,5 @@ bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
   auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, *builder_, arrayCache_);
   auto subs = disk_.subsets(diskKey);
-  return pickEntry(subs, canon, constraints, outAssignment);
+  return pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
 }

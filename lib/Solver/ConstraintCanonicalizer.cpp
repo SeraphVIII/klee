@@ -107,10 +107,16 @@ public:
     const UpdateList &ul = re.updates;
     const Array *root = ul.root;
 
+    // Fast path: no update chain and root not substituted.
+    // The ExprVisitor framework handles index recursion via doChildren(),
+    // rebuilding the ReadExpr only if the index sub-expression changes.
+    auto it = subst_.find(root);
+    if (it == subst_.end() && !ul.head)
+      return Action::doChildren();
+
     // Look up the root array. If it isn't in subst_ we still need to
     // rebuild if the update chain contains expressions that reference
     // other arrays that *are* in subst_.
-    auto it = subst_.find(root);
     const Array *newRoot = (it != subst_.end()) ? it->second : root;
 
     // Rebuild the update chain oldest-first (head is most recent write,
