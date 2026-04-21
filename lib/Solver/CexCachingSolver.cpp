@@ -21,7 +21,6 @@
 #include "klee/Solver/SolverImpl.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Solver/DiskCexCache.h"
-#include "klee/Solver/MapOfSetsDiskBuilder.h"
 #include "klee/Solver/SolverCmdLine.h"
 #include "klee/Solver/SolverStats.h"
 #include "klee/Support/ErrorHandling.h"
@@ -29,7 +28,11 @@
 
 #include "llvm/Support/CommandLine.h"
 
+#include <cerrno>
+#include <fcntl.h>
 #include <memory>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 
 using namespace klee;
@@ -65,15 +68,15 @@ cl::opt<std::string> DiskCexCacheFile(
 
 cl::opt<std::string> WriteDiskCexCacheFile(
     "write-disk-cex-cache",
-    cl::desc("If set, write the in-memory CEX cache to this file on exit"),
+    cl::desc("Append new CEX cache entries to this log file during the run"),
     cl::init(""),
     cl::cat(SolvingCat));
 
 cl::opt<std::string> PersistentCexCacheFile(
     "persistent-cex-cache",
-    cl::desc("Path to a persistent CEX cache file: read on startup and "
-             "updated on exit (shorthand for --disk-cex-cache=X "
-             "--write-disk-cex-cache=X with the same path)"),
+    cl::desc("Read cache from this file on startup, append new entries to "
+             "<path>.log during the run (use the offline merge tool to "
+             "incorporate the log back into the cache file)"),
     cl::init(""),
     cl::cat(SolvingCat));
 
@@ -137,15 +140,13 @@ class CexCachingSolver : public SolverImpl {
   uint64_t diskCacheHitCount_ = 0;
   bool diskCacheGivenUp_ = false;
 
-  // Write-back: pre-serialized tree built incrementally at insert time so
-  // that canonicalization runs while all Array objects are still alive.
-  // Only populated when --write-disk-cex-cache or --persistent-cex-cache is set.
-  MapOfSetsDiskBuilder::UBTree diskWriteTree_;
-  ArrayCache diskWriteArrayCache_;
-  std::unique_ptr<ExprBuilder> diskWriteBuilder_;
-  std::string diskWritePath_; // resolved write destination (empty = disabled)
+  // Append-only log: new entries are written to a log file during the run.
+  // Canonicalization is done eagerly while Array objects are still alive.
+  int logFd_ = -1;
+  ArrayCache logArrayCache_;
+  std::unique_ptr<ExprBuilder> logExprBuilder_;
 
-  void addToDiskWriteTree(const KeyType &key, Assignment *a);
+  void appendToCacheLog(const KeyType &key, Assignment *a);
 
   bool searchForAssignment(KeyType &key,
                            Assignment *&result);
@@ -363,8 +364,8 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
   result = binding;
   cache.insert(key, binding);
 
-  if (diskWriteBuilder_)
-    addToDiskWriteTree(key, binding);
+  if (logFd_ >= 0)
+    appendToCacheLog(key, binding);
 
   return true;
 }
@@ -372,48 +373,37 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 ///
 CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     : solver(std::move(solver)) {
-  // --persistent-cex-cache is shorthand for setting both read and write to
-  // the same file.  Explicit --disk-cex-cache / --write-disk-cex-cache take
-  // precedence if provided alongside it.
   const std::string readPath = !DiskCexCacheFile.empty()
                                    ? DiskCexCacheFile.getValue()
                                    : PersistentCexCacheFile.getValue();
-  diskWritePath_ = !WriteDiskCexCacheFile.empty()
-                       ? WriteDiskCexCacheFile.getValue()
-                       : PersistentCexCacheFile.getValue();
+
+  // Determine log file path: --write-disk-cex-cache takes precedence,
+  // otherwise --persistent-cex-cache=X writes to X.log.
+  std::string logPath;
+  if (!WriteDiskCexCacheFile.empty())
+    logPath = WriteDiskCexCacheFile.getValue();
+  else if (!PersistentCexCacheFile.empty())
+    logPath = PersistentCexCacheFile.getValue() + ".log";
 
   if (!readPath.empty())
     diskCexCache_ = std::make_unique<DiskCexCache>(readPath, buildCacheMetadata());
-  if (!diskWritePath_.empty())
-    diskWriteBuilder_.reset(createDefaultExprBuilder());
+
+  if (!logPath.empty()) {
+    logFd_ = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (logFd_ < 0) {
+      klee_warning("Cannot open CEX cache log '%s': %s",
+                   logPath.c_str(), strerror(errno));
+    } else {
+      logExprBuilder_.reset(createDefaultExprBuilder());
+      klee_message("CEX cache log: %s", logPath.c_str());
+    }
+  }
 }
 
 
 CexCachingSolver::~CexCachingSolver() {
-  if (diskWriteBuilder_) {
-    const std::string &path = diskWritePath_;
-
-    // Merge existing cache file entries that are not already in diskWriteTree_
-    // (new entries from this run take precedence). This is done at exit rather
-    // than at startup so that diskWriteTree_ stays small during the KLEE run.
-    mapofsets::DiskMapOfSets existing(path);
-    if (existing.isValid()) {
-      size_t merged = 0;
-      existing.forEach([&](const std::set<std::string> &keySet,
-                           const std::string &val) {
-        if (!diskWriteTree_.lookup(keySet)) {
-          diskWriteTree_.insert(keySet, val);
-          ++merged;
-        }
-      });
-      if (merged)
-        klee_message("Merged %zu existing entries from disk CEX cache %s",
-                     merged, path.c_str());
-    }
-
-    klee_message("Writing disk CEX cache to %s", path.c_str());
-    MapOfSetsDiskBuilder::build(diskWriteTree_, path, buildCacheMetadata());
-  }
+  if (logFd_ >= 0)
+    close(logFd_);
 
   cache.clear();
   for (assignmentsTable_ty::iterator it = assignmentsTable.begin(),
@@ -421,17 +411,41 @@ CexCachingSolver::~CexCachingSolver() {
     delete *it;
 }
 
-void CexCachingSolver::addToDiskWriteTree(const KeyType &key, Assignment *a) {
-  // Canonicalize eagerly while all Array objects are still alive.
-  // buildConstraintDiskKey is the shared implementation used by the read path
-  // (DiskCexCache) — using it here guarantees write and read keys are identical.
+// Log record format (each record is a single write() for atomicity):
+//   [u32 num_keys]
+//     ([u32 key_len][key_bytes]) × num_keys
+//   [u32 val_len]
+//   [val_bytes]
+//
+// The offline merge tool reads these records sequentially and incorporates
+// them into the cache file via MapOfSetsDiskBuilder.
+void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   std::vector<ref<Expr>> vec(key.begin(), key.end());
   auto [diskKey, canon] =
-      buildConstraintDiskKey(vec, *diskWriteBuilder_, diskWriteArrayCache_);
+      buildConstraintDiskKey(vec, *logExprBuilder_, logArrayCache_);
 
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
-                        : ""; // empty = UNSAT sentinel in v2 binary format
-  diskWriteTree_.insert(diskKey, value);
+                        : ""; // empty = UNSAT sentinel
+
+  // Build the record in a single buffer so it can be written atomically.
+  std::string record;
+  uint32_t numKeys = static_cast<uint32_t>(diskKey.size());
+  record.append(reinterpret_cast<const char *>(&numKeys), 4);
+  for (const auto &k : diskKey) {
+    uint32_t klen = static_cast<uint32_t>(k.size());
+    record.append(reinterpret_cast<const char *>(&klen), 4);
+    record.append(k);
+  }
+  uint32_t vlen = static_cast<uint32_t>(value.size());
+  record.append(reinterpret_cast<const char *>(&vlen), 4);
+  record.append(value);
+
+  // Single write() with O_APPEND is atomic for sizes < PIPE_BUF (~4KB).
+  // Our records are typically 100-500 bytes.
+  ssize_t written = write(logFd_, record.data(), record.size());
+  if (written < 0 || static_cast<size_t>(written) != record.size())
+    klee_warning("CEX cache log: short write (%zd of %zu bytes)",
+                 written, record.size());
 }
 
 bool CexCachingSolver::computeValidity(const Query& query,

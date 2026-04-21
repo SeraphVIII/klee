@@ -629,8 +629,8 @@ TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
 }
 
 // MergeRoundTrip verifies that allEntries() faithfully recovers every stored
-// entry, and that the merge-on-write path (seed diskWriteTree_ from existing
-// file, add new entries, rebuild) produces a file that contains both sets.
+// entry, and that the offline merge path (read existing file, add new entries,
+// rebuild via MapOfSetsDiskBuilder) produces a file that contains both sets.
 //
 // Generation 1: {constrX -> SAT}, {constrY -> UNSAT}
 // Generation 2: merge gen1 + add {constrZ -> SAT}
