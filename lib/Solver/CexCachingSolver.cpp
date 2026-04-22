@@ -80,16 +80,20 @@ cl::opt<std::string> PersistentCexCacheFile(
     cl::init(""),
     cl::cat(SolvingCat));
 
-// Minimum number of disk-cache lookups that must occur before the hit-rate
-// check fires.  During this warm-up period the disk cache is always consulted.
-static constexpr unsigned kDiskCacheWarmupLookups = 50;
-
 cl::opt<unsigned> DiskCacheMinHitRatePct(
     "disk-cex-cache-min-hit-rate",
-    cl::desc("Disable the disk CEX cache for the rest of the run once at least "
-             "50 lookups have been made and the hit rate falls below this "
-             "percentage (0 = never disable, default = 10)"),
+    cl::desc("Suspend the disk CEX cache when the hit rate over the last "
+             "--disk-cex-cache-hit-rate-window lookups falls below this "
+             "percentage; re-enable after the same number of misses "
+             "(0 = never suspend, default = 10)"),
     cl::init(10),
+    cl::cat(SolvingCat));
+
+cl::opt<unsigned> DiskCacheHitRateWindow(
+    "disk-cex-cache-hit-rate-window",
+    cl::desc("Sliding-window size (number of recent lookups) used by "
+             "--disk-cex-cache-min-hit-rate (default = 200)"),
+    cl::init(200),
     cl::cat(SolvingCat));
 
 cl::opt<bool> DebugCexCacheCheckBinding(
@@ -135,10 +139,17 @@ class CexCachingSolver : public SolverImpl {
   // Disk cache support
   std::unique_ptr<DiskCexCache> diskCexCache_;
 
-  // Hit-rate early-exit: disable disk cache if hit rate is too low after warmup.
-  uint64_t diskCacheLookups_ = 0;
-  uint64_t diskCacheHitCount_ = 0;
-  bool diskCacheGivenUp_ = false;
+  // Sliding-window hit-rate tracking.
+  // The window holds the last min(lookups, windowSize) hit(1)/miss(0) results.
+  // When the hit rate in the window falls below the threshold the disk cache is
+  // suspended; it is re-tried after windowSize consecutive skips so that a
+  // temporary bad patch does not permanently poison the cache.
+  std::vector<uint8_t> diskCacheWindow_;  // circular buffer, lazily sized
+  unsigned diskCacheWindowPos_  = 0;      // next write index
+  unsigned diskCacheWindowFill_ = 0;      // entries written so far (saturates at window size)
+  unsigned diskCacheWindowHits_ = 0;      // hits currently in window
+  uint64_t diskCacheSuspendedAt_ = 0;     // lookup count when last suspended (0 = active)
+  uint64_t diskCacheLookups_    = 0;      // total lookups (including suspended skips)
 
   // Append-only log: new entries are written to a log file during the run.
   // Canonicalization is done eagerly while Array objects are still alive.
@@ -261,27 +272,64 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
     }
   }
 
-  if (diskCexCache_ && !diskCacheGivenUp_) {
+  if (diskCexCache_) {
+    // Lazily size the window on first use so it reflects the CLI option value.
+    if (diskCacheWindow_.empty()) {
+      unsigned w = std::max(DiskCacheHitRateWindow.getValue(), 1u);
+      diskCacheWindow_.assign(w, 0);
+    }
+
+    const unsigned W = static_cast<unsigned>(diskCacheWindow_.size());
+
+    // If suspended, skip disk lookup until we have accumulated W more misses
+    // since suspension, then re-enable and give the cache another chance.
+    if (diskCacheSuspendedAt_ != 0) {
+      ++diskCacheLookups_;
+      if (diskCacheLookups_ - diskCacheSuspendedAt_ >= W) {
+        diskCacheSuspendedAt_ = 0;
+        diskCacheWindowPos_   = 0;
+        diskCacheWindowFill_  = 0;
+        diskCacheWindowHits_  = 0;
+        klee_message("DiskCexCache: re-enabling after %u-lookup cooldown", W);
+      } else {
+        return false;
+      }
+    }
+
     Assignment *diskResult = nullptr;
     ++diskCacheLookups_;
-    if (diskCexCache_->find(key, CexCacheSuperSet, diskResult)) {
-      ++diskCacheHitCount_;
+    const bool hit = diskCexCache_->find(key, CexCacheSuperSet, diskResult);
+
+    if (hit) {
       ++stats::queryCexDiskCacheHits;
+    } else {
+      ++stats::queryCexDiskCacheMisses;
+    }
+
+    // Update sliding window.
+    if (diskCacheWindowFill_ == W) {
+      // Evict oldest entry.
+      diskCacheWindowHits_ -= diskCacheWindow_[diskCacheWindowPos_];
+    } else {
+      ++diskCacheWindowFill_;
+    }
+    diskCacheWindow_[diskCacheWindowPos_] = hit ? 1u : 0u;
+    diskCacheWindowHits_ += hit ? 1u : 0u;
+    diskCacheWindowPos_ = (diskCacheWindowPos_ + 1) % W;
+
+    if (hit) {
       result = diskResult;
       return true;
     }
-    ++stats::queryCexDiskCacheMisses;
 
-    // After the warm-up window, disable if hit rate is below the threshold.
-    if (DiskCacheMinHitRatePct > 0 &&
-        diskCacheLookups_ >= kDiskCacheWarmupLookups &&
-        diskCacheHitCount_ * 100 < diskCacheLookups_ * DiskCacheMinHitRatePct) {
-      diskCacheGivenUp_ = true;
-      klee_warning("DiskCexCache: hit rate %.1f%% after %llu lookups — "
-                   "disabling for this run (threshold %u%%)",
-                   diskCacheHitCount_ * 100.0 / diskCacheLookups_,
-                   (unsigned long long)diskCacheLookups_,
-                   DiskCacheMinHitRatePct.getValue());
+    // Suspend if the window is full and the hit rate is below the threshold.
+    if (DiskCacheMinHitRatePct > 0 && diskCacheWindowFill_ == W &&
+        diskCacheWindowHits_ * 100 < W * DiskCacheMinHitRatePct) {
+      diskCacheSuspendedAt_ = diskCacheLookups_;
+      klee_warning("DiskCexCache: hit rate %.1f%% over last %u lookups — "
+                   "suspending (threshold %u%%, will retry after %u misses)",
+                   diskCacheWindowHits_ * 100.0 / W, W,
+                   DiskCacheMinHitRatePct.getValue(), W);
     }
   }
 
