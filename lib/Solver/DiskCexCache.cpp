@@ -107,7 +107,7 @@ DiskCexCache::parseValue(const std::string &val) const {
 // Assignment deserialization
 // ---------------------------------------------------------------------------
 
-Assignment *
+std::unique_ptr<Assignment>
 DiskCexCache::parseAssignmentData(
     const std::string &data,
     const std::map<std::string, const Array *> &nameToOrig) {
@@ -138,10 +138,10 @@ DiskCexCache::parseAssignmentData(
     }
     pos += data_len;
   }
+  // Reject blobs with trailing bytes (defensive: catches future format drift).
+  if (pos != data.size()) return nullptr;
 
-  auto *a = new Assignment(objects, values);
-  ownedAssignments_.emplace_back(a);
-  return a;
+  return std::make_unique<Assignment>(objects, values);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +172,14 @@ bool DiskCexCache::pickEntry(
       }
       break;
     case ValueKind::AssignmentData: {
-      Assignment *a = parseAssignmentData(pv.satData, nameToOrig);
+      // Allocate locally; only retain on success.  Rejecting candidates were
+      // previously leaked into ownedAssignments_, growing the heap unbounded
+      // over a long KLEE run.
+      auto a = parseAssignmentData(pv.satData, nameToOrig);
       if (a && a->satisfies(originalConstraints.begin(),
                             originalConstraints.end())) {
-        outAssignment = a;
+        outAssignment = a.get();
+        ownedAssignments_.push_back(std::move(a));
         return true;
       }
       break;

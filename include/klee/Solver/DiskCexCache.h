@@ -72,8 +72,12 @@ private:
 
   ParsedValue parseValue(const std::string &val) const;
 
-  /// Returns nullptr on parse failure; on success owned by ownedAssignments_.
-  Assignment *parseAssignmentData(
+  /// Returns nullptr on parse failure.  Caller decides ownership: retain by
+  /// moving into `ownedAssignments_` (and exposing `.get()` to consumers) or
+  /// let it die at end of scope.  We don't push into `ownedAssignments_`
+  /// here because pickEntry typically parses several candidates per lookup
+  /// and only keeps the first that satisfies the live constraints.
+  std::unique_ptr<Assignment> parseAssignmentData(
       const std::string &data,
       const std::map<std::string, const Array *> &nameToOrig);
 
