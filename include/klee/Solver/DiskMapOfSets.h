@@ -95,7 +95,9 @@ private:
                       std::vector<std::string>& results);
 
   // Full traversal with callback; accum tracks the current path for key_set.
+  // visited guards against circular child_id references in malformed files.
   void enumerate_all(uint32_t node_id, std::set<std::string> &accum,
+                     std::vector<bool> &visited,
                      const std::function<void(const std::set<std::string>&,
                                               const std::string&)> &cb);
 };

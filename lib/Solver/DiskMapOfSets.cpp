@@ -5,6 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 
+// On-disk multi-byte integers are read with raw memcpy.  Until that goes
+// through explicit LE helpers, the format is little-endian only.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "MapOfSets file format requires a little-endian host");
+#endif
+
 using namespace klee::mapofsets;
 
 DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
@@ -58,6 +65,13 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   if (version != 1) {
     fail("DiskMapOfSets: unsupported format version (delete and re-run) in");
     return;
+  }
+
+  // chunk_id / local_id divide by chunk_size; a corrupt header with 0 here
+  // would SIGFPE on the first lookup.  The writer never produces 0 (default
+  // 1024) so this only catches malformed/adversarial files.
+  if (header_file_.header().chunk_size() == 0) {
+    fail("DiskMapOfSets: chunk_size is zero in"); return;
   }
 
   // Canonicalization version check: keys are produced by
@@ -136,11 +150,14 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   uint64_t dir_off = header_file_.header().directory_offset();
   uint64_t chunk_entry_off = dir_off + (uint64_t)chunk_id * 12ULL;
 
+  // All bad-file paths below mark the cache invalid and return nullptr.
+  // Callers (get_node) translate that into a default Node so trie traversals
+  // degrade to "miss" rather than crashing the KLEE process.
   if (chunk_entry_off + 12ULL > (uint64_t)file_size_) {
-    klee_message("DiskMapOfSets: chunk directory entry out of range "
-                 "(chunk_id=%u, entry_off=%llu)\n",
-                 chunk_id, (unsigned long long)chunk_entry_off);
-    abort();
+    klee_warning("DiskMapOfSets: chunk directory entry out of range "
+                 "(chunk_id=%u); marking cache invalid", chunk_id);
+    valid_ = false;
+    return nullptr;
   }
 
   Chunk chunk;
@@ -148,17 +165,27 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   memcpy(&chunk.size,   static_cast<const char *>(mmap_base_) + chunk_entry_off + 8, 4);
 
   if (chunk.offset > (uint64_t)file_size_) {
-    klee_message("DiskMapOfSets: chunk out of range (offset past EOF)\n"); abort();
+    klee_warning("DiskMapOfSets: chunk %u offset past EOF; marking cache invalid",
+                 chunk_id);
+    valid_ = false;
+    return nullptr;
   }
   if ((uint64_t)chunk.size > (uint64_t)file_size_ - chunk.offset) {
-    klee_message("DiskMapOfSets: chunk out of range (size exceeds EOF)\n"); abort();
+    klee_warning("DiskMapOfSets: chunk %u size exceeds EOF; marking cache invalid",
+                 chunk_id);
+    valid_ = false;
+    return nullptr;
   }
 
   chunk.parsed = std::make_unique<NodeChunk>();
   google::protobuf::io::ArrayInputStream chunk_stream(
       static_cast<const char *>(mmap_base_) + chunk.offset, chunk.size);
-  if (!chunk.parsed->ParseFromZeroCopyStream(&chunk_stream))
-    klee_error("DiskMapOfSets: failed to parse chunk %u", chunk_id);
+  if (!chunk.parsed->ParseFromZeroCopyStream(&chunk_stream)) {
+    klee_warning("DiskMapOfSets: failed to parse chunk %u; marking cache invalid",
+                 chunk_id);
+    valid_ = false;
+    return nullptr;
+  }
 
   NodeChunk *raw = chunk.parsed.get();
   lru_order_.push_front(chunk_id);
@@ -168,9 +195,21 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
 }
 
 const Node &DiskMapOfSets::get_node(uint32_t node_id) {
+  // Static empty Node: default-initialised has is_end_of_set=false and no
+  // children, which is exactly what we want for graceful degradation when
+  // the file is corrupt — callers see a "miss" and stop recursing.
+  static const Node kEmptyNode;
   uint32_t cid = chunk_id(node_id);
   uint32_t lid = local_id(node_id);
-  return get_chunk(cid)->nodes(lid);
+  NodeChunk *chunk = get_chunk(cid);
+  if (!chunk) return kEmptyNode;
+  if (lid >= static_cast<uint32_t>(chunk->nodes_size())) {
+    klee_warning("DiskMapOfSets: node %u out of chunk bounds; "
+                 "marking cache invalid", node_id);
+    valid_ = false;
+    return kEmptyNode;
+  }
+  return chunk->nodes(lid);
 }
 
 const std::string &DiskMapOfSets::key_str(uint32_t index) const {
@@ -187,6 +226,11 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   uint64_t val_off = header_file_.header().values_offset();
   uint64_t val_sz  = header_file_.header().values_size();
 
+  // Bounds invariant established by the constructor:
+  //   val_off + val_sz <= file_size_
+  // The strict `>` comparisons are correct: `real + 4 == val_sz` means the
+  // length field exactly fills the values region (still within the mmap),
+  // which is a valid edge case.  Do NOT change to `>=`.
   if (real + 4ULL > val_sz) return "";
   const char *blob = static_cast<const char *>(mmap_base_) + val_off + real;
   uint32_t len = 0;
@@ -314,8 +358,22 @@ void DiskMapOfSets::find_supersets(
 void DiskMapOfSets::enumerate_all(
     uint32_t node_id,
     std::set<std::string> &accum,
+    std::vector<bool> &visited,
     const std::function<void(const std::set<std::string>&,
                              const std::string&)> &cb) {
+  // Guard against malformed files with circular child_id references.  The
+  // bounded query traversals (lookup_rec, find_subsets, find_supersets) all
+  // shrink the query by one element per recursion so they self-terminate;
+  // forEach has no such bound, so we track visited nodes explicitly.
+  if (node_id < visited.size()) {
+    if (visited[node_id]) {
+      klee_warning("DiskMapOfSets: cycle detected at node %u during forEach; "
+                   "marking cache invalid", node_id);
+      valid_ = false;
+      return;
+    }
+    visited[node_id] = true;
+  }
   const auto &node = get_node(node_id);
   if (node.is_end_of_set())
     cb(accum, read_value(node.value_offset()));
@@ -323,7 +381,7 @@ void DiskMapOfSets::enumerate_all(
   for (const auto &child : node.children()) {
     const std::string &key = key_str(child.key_index());
     accum.insert(key);
-    enumerate_all(child.child_id(), accum, cb);
+    enumerate_all(child.child_id(), accum, visited, cb);
     accum.erase(key);
   }
 }
@@ -332,7 +390,10 @@ void DiskMapOfSets::forEach(
     std::function<void(const std::set<std::string>&, const std::string&)> cb) {
   if (!valid_) return;
   std::set<std::string> accum;
-  enumerate_all(header_file_.header().root_id(), accum, cb);
+  // Bitmap sized by total_nodes; a corrupt file with child_id >= total_nodes
+  // simply skips the visited check (the access is bounds-protected).
+  std::vector<bool> visited(header_file_.header().total_nodes(), false);
+  enumerate_all(header_file_.header().root_id(), accum, visited, cb);
 }
 
 std::vector<DiskMapOfSets::Entry> DiskMapOfSets::allEntries() {
