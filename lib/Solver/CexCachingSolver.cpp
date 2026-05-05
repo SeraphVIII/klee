@@ -459,12 +459,16 @@ CexCachingSolver::~CexCachingSolver() {
     delete *it;
 }
 
-// Log record format (each record is a single write() for atomicity):
+// Log record format:
 //   [u32 num_keys]
 //     ([u32 key_len][key_bytes]) × num_keys
 //   [u32 val_len]
 //   [val_bytes]
+//   [u32 num_concrete_arrays]
+//     ([u8 name_index][u32 data_len LE][data_len bytes]) × num_concrete_arrays
 //
+// name_index is the integer suffix of the canonical array name "A{n}".
+// num_concrete_arrays is 0 when all arrays in the entry are symbolic.
 // The offline merge tool reads these records sequentially and incorporates
 // them into the cache file via MapOfSetsDiskBuilder.
 void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
@@ -475,7 +479,26 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
                         : ""; // empty = UNSAT sentinel
 
-  // Build the record in a single buffer so it can be written atomically.
+  // Collect concrete canonical arrays (those whose originals had known byte
+  // values), sorted by canonical index so the reader order is deterministic.
+  struct ConcreteEntry { uint8_t idx; std::vector<unsigned char> bytes; };
+  std::vector<ConcreteEntry> concretes;
+  for (const auto &[orig, canon_arr] : canon.forwardArrayMap) {
+    if (!canon_arr->isConstantArray()) continue;
+    uint8_t idx = static_cast<uint8_t>(
+        std::stoi(canon_arr->name.substr(1)));
+    std::vector<unsigned char> bytes;
+    bytes.reserve(canon_arr->constantValues.size());
+    for (const auto &cv : canon_arr->constantValues)
+      bytes.push_back(static_cast<unsigned char>(cv->getZExtValue()));
+    concretes.push_back({idx, std::move(bytes)});
+  }
+  std::sort(concretes.begin(), concretes.end(),
+            [](const ConcreteEntry &x, const ConcreteEntry &y) {
+              return x.idx < y.idx;
+            });
+
+  // Build the record in a single buffer.
   std::string record;
   uint32_t numKeys = static_cast<uint32_t>(diskKey.size());
   record.append(reinterpret_cast<const char *>(&numKeys), 4);
@@ -488,8 +511,15 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   record.append(reinterpret_cast<const char *>(&vlen), 4);
   record.append(value);
 
-  // Single write() with O_APPEND is atomic for sizes < PIPE_BUF (~4KB).
-  // Our records are typically 100-500 bytes.
+  uint32_t numConcrete = static_cast<uint32_t>(concretes.size());
+  record.append(reinterpret_cast<const char *>(&numConcrete), 4);
+  for (const auto &ce : concretes) {
+    record.push_back(static_cast<char>(ce.idx));
+    uint32_t len = static_cast<uint32_t>(ce.bytes.size());
+    record.append(reinterpret_cast<const char *>(&len), 4);
+    record.append(reinterpret_cast<const char *>(ce.bytes.data()), len);
+  }
+
   ssize_t written = write(logFd_, record.data(), record.size());
   if (written < 0 || static_cast<size_t>(written) != record.size())
     klee_warning("CEX cache log: short write (%zd of %zu bytes)",

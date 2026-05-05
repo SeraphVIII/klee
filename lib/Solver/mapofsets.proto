@@ -4,7 +4,7 @@ package klee.mapofsets;
 
 message Header {
   uint64 magic                    = 1;  // 0x4d41504f53455453ULL ("MAPOSETS")
-  uint32 version                  = 2;  // 2 (v1 is no longer supported)
+  uint32 version                  = 2;  // 1
   uint32 root_id                  = 3;
   uint64 total_nodes              = 4;
   uint32 canonicalization_version = 5;  // key format version; must match current build

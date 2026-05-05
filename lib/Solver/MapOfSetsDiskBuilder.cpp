@@ -122,7 +122,7 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   mapofsets::MapOfSetsFile file;
   mapofsets::Header *hdr = file.mutable_header();
   hdr->set_magic(kRawMagic);
-  hdr->set_version(2);
+  hdr->set_version(1);
   // Increment kCanonVersion whenever the canonicalization algorithm or key
   // serialization format changes so that readers can reject stale cache files.
   static constexpr uint32_t kCanonVersion = 1;

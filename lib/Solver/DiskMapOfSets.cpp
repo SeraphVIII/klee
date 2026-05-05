@@ -54,9 +54,8 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     fail("DiskMapOfSets: failed to parse header protobuf in"); return;
   }
 
-  // Version check: only v2 is supported; v1 files must be rebuilt.
   uint32_t version = header_file_.header().version();
-  if (version != 2) {
+  if (version != 1) {
     fail("DiskMapOfSets: unsupported format version (delete and re-run) in");
     return;
   }

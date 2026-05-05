@@ -16,14 +16,11 @@
 //   appear in the constraint strings and feed a synthetic KQuery to the
 //   kleaver parser to recover ref<Expr> objects.
 //
-// Concrete-array limitation
-//   The original Array's `constantValues` are not preserved in the canonical
-//   key strings (printSingleExpr drops them).  We therefore reconstruct every
-//   array as fully symbolic.  This is sound for re-verifying UNSAT (more
-//   freedom => harder to be UNSAT, so a re-verified UNSAT still implies the
-//   original) but not for re-verifying SAT.  Passes that need stronger
-//   guarantees should consult `ParsedKey::hasReadFromUnknownArrayContents` and
-//   skip such entries.
+//   When the log record includes a concrete-arrays section (written by
+//   CexCachingSolver::appendToCacheLog), callers pass that data to parseKey,
+//   which reconstructs concrete arrays faithfully instead of using symbolic
+//   placeholders.  Entries loaded from a cache file (which does not store
+//   concrete-array metadata) still use symbolic reconstruction.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,6 +39,10 @@
 #include <set>
 #include <string>
 #include <vector>
+
+namespace klee {
+class Z3Builder; // private to lib/Solver, owned via unique_ptr below
+}
 
 namespace klee_pcache_opt {
 
@@ -75,9 +76,18 @@ public:
   ~OfflineEngine();
 
   /// Parse a canonical key (set of constraint strings) into a vector of
-  /// ref<Expr> constraints plus the symbolic arrays they reference.
-  /// On parse failure, returns ParsedKey with ok=false and an error message.
-  ParsedKey parseKey(const std::set<std::string> &key);
+  /// ref<Expr> constraints plus the arrays they reference.
+  /// \param concreteArrays  Optional concrete-array metadata from the log
+  ///        record: each pair is (canonical name_index, byte_values).  Arrays
+  ///        listed here are reconstructed as concrete KQuery arrays; all
+  ///        others are reconstructed as fully symbolic arrays of size
+  ///        kSyntheticArraySize.  Pass an empty vector (the default) when no
+  ///        metadata is available (e.g. entries loaded from a cache file).
+  /// On parse failure returns ParsedKey with ok=false and an error message.
+  ParsedKey parseKey(
+      const std::set<std::string> &key,
+      const std::vector<std::pair<uint8_t, std::vector<unsigned char>>>
+          &concreteArrays = {});
 
   /// Scan a constraint string for canonical array name references (A0, A1,
   /// ...).  Used by callers building up dependency clusters across entries.
@@ -96,6 +106,26 @@ public:
                         const std::vector<const klee::Array *> &arrays,
                         std::vector<std::vector<unsigned char>> &assignment,
                         bool &timedOut);
+
+  struct UnsatCoreResult {
+    /// Indices into the input constraint vector that participate in the core
+    /// returned by Z3.  Note: not guaranteed minimal — Z3's core may still
+    /// contain redundant constraints.  Callers wanting strict minimality
+    /// should follow up with delta-debugging on this subset.
+    std::vector<std::size_t> coreIndices;
+    /// True iff the constraint set was actually UNSAT.  False here means the
+    /// solver returned SAT (no core to extract) and `coreIndices` is empty.
+    bool ok = false;
+    /// True iff the underlying Z3 call hit the timeout.
+    bool timedOut = false;
+  };
+
+  /// Single-call unsat-core extraction via a parallel Z3 context.
+  /// Bypasses KLEE's solver chain entirely — uses Z3Builder + a fresh Z3
+  /// solver configured with `(set-option :unsat-core true)` and
+  /// `Z3_solver_assert_and_track`.
+  UnsatCoreResult
+  getUnsatCore(const std::vector<klee::ref<klee::Expr>> &constraints);
 
   struct MinimizationResult {
     /// Indices into `constraints` that form a minimal UNSAT subset.  If
@@ -150,6 +180,9 @@ private:
   klee::ArrayCache arrayCache_;
   std::unique_ptr<klee::ExprBuilder> builder_;
   std::unique_ptr<klee::Solver> solver_;
+  // Parallel Z3 context used for unsat-core extraction.  Lazily created on
+  // the first call so tools that never minimise UNSAT pay no Z3 overhead.
+  std::unique_ptr<klee::Z3Builder> z3Builder_;
   unsigned timeoutSec_;
 };
 

@@ -49,6 +49,7 @@
 #include "klee/ADT/MapOfSets.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -124,9 +125,28 @@ static int arrayNameIndex(const std::string &name) {
   return std::atoi(name.c_str() + 1);
 }
 
+static uint64_t hashKeySet(const std::set<std::string> &ks) {
+  uint64_t h = 14695981039346656037ULL;
+  for (const auto &s : ks) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    h ^= '\0'; h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+struct Conflict {
+  std::set<std::string> key_set;
+  std::string satSource;
+  std::string unsatSource;
+};
+
 struct LogEntry {
   std::set<std::string> key_set;
   std::string value;
+  // Concrete canonical arrays: (name_index, byte_values).
+  // Populated from the log record's concrete-arrays section; empty if all
+  // arrays in the entry were symbolic.
+  std::vector<std::pair<uint8_t, std::vector<unsigned char>>> concreteArrays;
 };
 
 /// Read all records from a CEX cache log file.
@@ -184,7 +204,29 @@ static size_t readLogFile(const std::string &path,
     std::string value(&buf[pos], vlen);
     pos += vlen;
 
-    out.push_back({std::move(keySet), std::move(value)});
+    // Read concrete arrays section.
+    if (pos + 4 > fileSize) break;
+    uint32_t numConcrete = 0;
+    memcpy(&numConcrete, &buf[pos], 4);
+    pos += 4;
+
+    std::vector<std::pair<uint8_t, std::vector<unsigned char>>> concretes;
+    bool concreteTruncated = false;
+    for (uint32_t i = 0; i < numConcrete; ++i) {
+      if (pos + 5 > fileSize) { concreteTruncated = true; break; }
+      uint8_t nameIdx = static_cast<uint8_t>(buf[pos++]);
+      uint32_t clen = 0;
+      memcpy(&clen, &buf[pos], 4); pos += 4;
+      if (pos + clen > fileSize) { concreteTruncated = true; break; }
+      std::vector<unsigned char> bytes(
+          reinterpret_cast<const unsigned char *>(&buf[pos]),
+          reinterpret_cast<const unsigned char *>(&buf[pos]) + clen);
+      pos += clen;
+      concretes.emplace_back(nameIdx, std::move(bytes));
+    }
+    if (concreteTruncated) break;
+
+    out.push_back({std::move(keySet), std::move(value), std::move(concretes)});
     ++count;
   }
 
@@ -304,6 +346,8 @@ int main(int argc, char **argv) {
   struct Entry {
     std::set<std::string> key_set;
     std::string value;
+    std::vector<std::pair<uint8_t, std::vector<unsigned char>>> concreteArrays;
+    std::string source; // "cache:<path>" or "log:<path>"
   };
 
   std::vector<Entry> unsatEntries, satEntries;
@@ -320,11 +364,12 @@ int main(int argc, char **argv) {
     storedSolver  = disk.solverBackend();
     storedVersion = disk.kleeVersion();
 
+    std::string cacheSource = "cache:" + inputPath;
     disk.forEach([&](const std::set<std::string> &ks, const std::string &v) {
       if (isUnsat(v))
-        unsatEntries.push_back({ks, v});
+        unsatEntries.push_back({ks, v, {}, cacheSource});
       else
-        satEntries.push_back({ks, v});
+        satEntries.push_back({ks, v, {}, cacheSource});
     });
     fprintf(stdout, "Cache file   : %s  (%zu entries)\n",
             inputPath.c_str(), unsatEntries.size() + satEntries.size());
@@ -334,11 +379,14 @@ int main(int argc, char **argv) {
   for (const auto &logPath : logPaths) {
     std::vector<LogEntry> logEntries;
     size_t n = readLogFile(logPath, logEntries);
+    std::string logSource = "log:" + logPath;
     for (auto &le : logEntries) {
       if (isUnsat(le.value))
-        unsatEntries.push_back({std::move(le.key_set), std::move(le.value)});
+        unsatEntries.push_back({std::move(le.key_set), std::move(le.value),
+                                std::move(le.concreteArrays), logSource});
       else
-        satEntries.push_back({std::move(le.key_set), std::move(le.value)});
+        satEntries.push_back({std::move(le.key_set), std::move(le.value),
+                              std::move(le.concreteArrays), logSource});
     }
     fprintf(stdout, "Log file     : %s  (%zu records)\n", logPath.c_str(), n);
   }
@@ -377,7 +425,7 @@ int main(int argc, char **argv) {
       // this matches the order parseKey emits constraints in.
       std::vector<std::string> orderedKeys(e.key_set.begin(), e.key_set.end());
 
-      ParsedKey pk = engine.parseKey(e.key_set);
+      ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
       if (!pk.ok) continue;
       if (pk.constraints.size() != orderedKeys.size()) continue;
 
@@ -432,7 +480,7 @@ int main(int argc, char **argv) {
       // Snapshot key strings in iteration order (matches parser output order).
       std::vector<std::string> orderedKeys(e.key_set.begin(), e.key_set.end());
 
-      ParsedKey pk = engine.parseKey(e.key_set);
+      ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
       if (!pk.ok || pk.constraints.size() != orderedKeys.size()) {
         ++splitSkippedParse;
         newSat.push_back(std::move(e));
@@ -481,17 +529,15 @@ int main(int argc, char **argv) {
         for (const auto &name : comp.arrayNames) {
           int idx = arrayNameIndex(name);
           const ValueArray *src = byIdx[static_cast<std::uint8_t>(idx)];
+          // KLEE's IndependentSolver asserts that two assignments for the
+          // same array produce the same byte count.  Truncating to the
+          // component's coverage breaks that invariant when the value is
+          // later mixed with a fresh full-size Z3 result.  So duplicate the
+          // full original bytes into each sub-blob; the only saving from
+          // splitting is on the *key* side, not the value side.
           ValueArray va;
           va.nameIndex = static_cast<std::uint8_t>(idx);
-          auto covIt = comp.arrayCoverage.find(name);
-          if (covIt != comp.arrayCoverage.end() && covIt->second.has_value()) {
-            std::uint32_t need = *covIt->second;
-            std::uint32_t take = std::min<std::uint32_t>(
-                need, static_cast<std::uint32_t>(src->bytes.size()));
-            va.bytes.assign(src->bytes.begin(), src->bytes.begin() + take);
-          } else {
-            va.bytes = src->bytes; // symbolic index ⇒ keep full coverage
-          }
+          va.bytes = src->bytes;
           subArrays.push_back(std::move(va));
         }
         std::sort(subArrays.begin(), subArrays.end(),
@@ -516,12 +562,15 @@ int main(int argc, char **argv) {
   // -------------------------------------------------------------------------
   // SAT witness compaction (Pass 3) — parser-only, no solver
   //
-  // Each entry's value blob may carry more bytes per array than the entry's
-  // constraints actually reference (e.g. the witness from KLEE was for a
-  // 4096-byte buffer but the constraints only touch bytes 0..3).  Truncating
-  // to the actual byte coverage shrinks the cache file without changing any
-  // semantics — superfluous trailing bytes never participate in a satisfies()
-  // check on a future query.
+  // The original plan was to truncate each array's byte count down to the
+  // entry's referenced byte coverage.  That turned out to be UNSOUND for
+  // KLEE consumption: IndependentSolver::computeInitialValues asserts that
+  // two assignments for the same array have matching byte counts, and a
+  // truncated cache hit mixed with a fresh full-size Z3 result trips the
+  // assert.  The only safe compaction is to *drop arrays the entry's
+  // constraints don't reference at all* — those bindings come from the
+  // original witness containing extra arrays and are pure bloat for this
+  // entry's lookups.  We do NOT truncate bytes of referenced arrays.
   // -------------------------------------------------------------------------
 
   size_t compactScanned     = 0;
@@ -538,26 +587,15 @@ int main(int argc, char **argv) {
       if (e.key_set.empty()) continue;
       ++compactScanned;
 
-      ParsedKey pk = engine.parseKey(e.key_set);
+      ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
       if (!pk.ok) { ++compactSkippedParse; continue; }
 
+      // Collect every array name that any constraint in the key references.
       auto comps = engine.computeByteComponents(pk.constraints);
-      // Merge per-component coverage into a single name -> coverage map.
-      // nullopt means "symbolic index touched this array — keep every byte".
-      std::map<std::string, std::optional<std::uint32_t>> coverage;
-      for (const auto &comp : comps) {
-        for (const auto &[name, cov] : comp.arrayCoverage) {
-          auto it = coverage.find(name);
-          if (it == coverage.end()) {
-            coverage.emplace(name, cov);
-          } else if (!cov.has_value()) {
-            it->second = std::nullopt;
-          } else if (it->second.has_value()) {
-            it->second = std::max(*it->second, *cov);
-          }
-          // else: already nullopt, leave as-is
-        }
-      }
+      std::set<std::string> referenced;
+      for (const auto &comp : comps)
+        for (const auto &name : comp.arrayNames)
+          referenced.insert(name);
 
       std::vector<ValueArray> arrays;
       if (!parseSatValue(e.value, arrays)) {
@@ -565,26 +603,18 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      bool changed = false;
+      std::vector<ValueArray> kept;
+      kept.reserve(arrays.size());
       std::size_t before = e.value.size();
       for (auto &va : arrays) {
         std::string name = "A" + std::to_string(va.nameIndex);
-        auto it = coverage.find(name);
-        if (it == coverage.end()) {
-          // Witness binds an array no constraint touches — drop entirely.
-          if (!va.bytes.empty()) { va.bytes.clear(); changed = true; }
-          continue;
-        }
-        if (!it->second.has_value()) continue; // symbolic index → keep all
-        std::uint32_t need = *it->second;
-        if (va.bytes.size() > need) {
-          va.bytes.resize(need);
-          changed = true;
-        }
+        if (referenced.count(name))
+          kept.push_back(std::move(va));
+        // else: drop unreferenced array binding entirely.
       }
-      if (!changed) continue;
+      if (kept.size() == arrays.size()) continue; // no array dropped
 
-      e.value = serializeSatValue(arrays);
+      e.value = serializeSatValue(kept);
       ++compactShrunk;
       compactBytesSaved += (before - e.value.size());
     }
@@ -698,16 +728,21 @@ int main(int argc, char **argv) {
   size_t satDuplicates   = 0;
   size_t satConflicts    = 0; // key_set present as UNSAT; SAT overwritten
 
+  std::vector<Conflict> conflicts;
+
   // --- SAT entries (inserted first so UNSAT can overwrite on conflict) ------
 
   // Track seen SAT key_sets for deduplication reporting.
   std::set<std::set<std::string>> satSeen;
+  // Map key_set → source so we can report the SAT side of any conflict.
+  std::map<std::set<std::string>, std::string> satKeyToSource;
 
   for (const auto &e : satEntries) {
     if (dedup && !satSeen.insert(e.key_set).second) {
       ++satDuplicates;
       continue;
     }
+    satKeyToSource[e.key_set] = e.source;
     result.insert(e.key_set, e.value);
   }
 
@@ -747,8 +782,13 @@ int main(int argc, char **argv) {
     }
 
     // Check for a conflicting SAT entry at the same key_set.
-    if (result.lookup(e.key_set) != nullptr)
+    if (result.lookup(e.key_set) != nullptr) {
       ++satConflicts;
+      auto it = satKeyToSource.find(e.key_set);
+      std::string satSrc =
+          (it != satKeyToSource.end()) ? it->second : "<unknown>";
+      conflicts.push_back({e.key_set, satSrc, e.source});
+    }
 
     // Insert UNSAT into result, overwriting any conflicting SAT value.
     result.insert(e.key_set, e.value);
@@ -803,6 +843,24 @@ int main(int argc, char **argv) {
   }
 
   // -------------------------------------------------------------------------
+  // Report SAT/UNSAT inconsistencies
+  // -------------------------------------------------------------------------
+
+  if (!conflicts.empty()) {
+    for (const auto &c : conflicts) {
+      fprintf(stderr,
+              "INCONSISTENCY key_hash=%016" PRIx64 " key_size=%zu"
+              " sat_from=%s unsat_from=%s\n",
+              hashKeySet(c.key_set), c.key_set.size(),
+              c.satSource.c_str(), c.unsatSource.c_str());
+    }
+    fprintf(stderr,
+            "warning: %zu SAT/UNSAT inconsistenc%s detected; "
+            "UNSAT entries were kept\n",
+            conflicts.size(), conflicts.size() == 1 ? "y" : "ies");
+  }
+
+  // -------------------------------------------------------------------------
   // Verification pass: roundtrip every entry through parser + solver
   // -------------------------------------------------------------------------
 
@@ -817,7 +875,7 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < entries.size(); ++i) {
         const auto &e = entries[i];
         if (e.key_set.empty()) { ++emptyKey; continue; }
-        ParsedKey pk = engine.parseKey(e.key_set);
+        ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
         if (!pk.ok) {
           ++parseFail;
           if (parseFail <= 3)
@@ -852,7 +910,7 @@ int main(int argc, char **argv) {
 
   if (statsOnly) {
     fprintf(stdout, "\n(--stats: no output written)\n");
-    return 0;
+    return conflicts.empty() ? 0 : 2;
   }
 
   // -------------------------------------------------------------------------
@@ -866,5 +924,5 @@ int main(int argc, char **argv) {
   MapOfSetsDiskBuilder::build(result, outputPath, meta);
 
   fprintf(stdout, "\nWritten to   : %s\n", outputPath.c_str());
-  return 0;
+  return conflicts.empty() ? 0 : 2;
 }

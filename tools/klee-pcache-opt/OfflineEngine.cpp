@@ -19,10 +19,16 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+// Z3Builder lives under lib/Solver/ — we add that to the include path
+// (see CMakeLists.txt) and pull the header directly so we can drive a
+// parallel Z3 context for unsat-core extraction.
+#include "Z3Builder.h"
+
 #include <cctype>
 #include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -56,6 +62,93 @@ OfflineEngine::OfflineEngine(unsigned coreSolverTimeoutSeconds)
 OfflineEngine::~OfflineEngine() = default;
 
 // ---------------------------------------------------------------------------
+// Unsat-core extraction (parallel Z3 context)
+// ---------------------------------------------------------------------------
+
+OfflineEngine::UnsatCoreResult
+OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
+  UnsatCoreResult res;
+  if (constraints.empty())
+    return res;
+
+  if (!z3Builder_)
+    z3Builder_.reset(
+        new Z3Builder(/*autoClearConstructCache=*/false,
+                      /*z3LogInteractionFile=*/nullptr));
+
+  Z3_context ctx = z3Builder_->ctx;
+  Z3_solver solver = Z3_mk_solver(ctx);
+  Z3_solver_inc_ref(ctx, solver);
+
+  // Configure: enable core production + per-call timeout.
+  Z3_params params = Z3_mk_params(ctx);
+  Z3_params_inc_ref(ctx, params);
+  Z3_params_set_bool(ctx, params,
+                     Z3_mk_string_symbol(ctx, "unsat_core"), true);
+  if (timeoutSec_ > 0)
+    Z3_params_set_uint(ctx, params,
+                       Z3_mk_string_symbol(ctx, "timeout"),
+                       timeoutSec_ * 1000u);
+  Z3_solver_set_params(ctx, solver, params);
+  Z3_params_dec_ref(ctx, params);
+
+  // Track each constraint with a fresh boolean literal so the unsat core
+  // call can identify which constraints participated.
+  Z3_sort boolSort = Z3_mk_bool_sort(ctx);
+  std::vector<Z3_ast> trackers;
+  trackers.reserve(constraints.size());
+  std::unordered_map<unsigned, std::size_t> idToIndex;
+
+  for (std::size_t i = 0; i < constraints.size(); ++i) {
+    Z3_ast tracker = Z3_mk_fresh_const(ctx, "c", boolSort);
+    Z3_inc_ref(ctx, tracker);
+    trackers.push_back(tracker);
+    idToIndex[Z3_get_ast_id(ctx, tracker)] = i;
+
+    Z3ASTHandle ast = z3Builder_->construct(constraints[i]);
+    Z3_solver_assert_and_track(ctx, solver, ast, tracker);
+  }
+
+  Z3_lbool sat = Z3_solver_check(ctx, solver);
+
+  auto cleanup = [&]() {
+    for (Z3_ast t : trackers) Z3_dec_ref(ctx, t);
+    Z3_solver_dec_ref(ctx, solver);
+    z3Builder_->clearConstructCache();
+  };
+
+  if (sat == Z3_L_UNDEF) {
+    // Either timeout or other unknown reason — we can't tell apart cheaply
+    // here; treat as timeout for the caller's purposes (the existing
+    // delta-debug fallback will simply not shrink).
+    res.timedOut = true;
+    cleanup();
+    return res;
+  }
+  if (sat == Z3_L_TRUE) {
+    cleanup();
+    return res; // ok=false, coreIndices empty
+  }
+
+  Z3_ast_vector core = Z3_solver_get_unsat_core(ctx, solver);
+  Z3_ast_vector_inc_ref(ctx, core);
+  unsigned n = Z3_ast_vector_size(ctx, core);
+  res.coreIndices.reserve(n);
+  for (unsigned k = 0; k < n; ++k) {
+    Z3_ast t = Z3_ast_vector_get(ctx, core, k);
+    auto it = idToIndex.find(Z3_get_ast_id(ctx, t));
+    if (it != idToIndex.end())
+      res.coreIndices.push_back(it->second);
+  }
+  Z3_ast_vector_dec_ref(ctx, core);
+  std::sort(res.coreIndices.begin(), res.coreIndices.end());
+
+  res.ok = true;
+  cleanup();
+  return res;
+}
+
+// ---------------------------------------------------------------------------
 // Canonical-key parsing
 // ---------------------------------------------------------------------------
 
@@ -86,13 +179,21 @@ void OfflineEngine::collectArrayNames(const std::string &s,
   }
 }
 
-ParsedKey OfflineEngine::parseKey(const std::set<std::string> &key) {
+ParsedKey OfflineEngine::parseKey(
+    const std::set<std::string> &key,
+    const std::vector<std::pair<uint8_t, std::vector<unsigned char>>>
+        &concreteArrays) {
   ParsedKey result;
 
   if (key.empty()) {
     result.ok = true;
     return result;
   }
+
+  // Build a lookup from canonical name_index → byte vector for concrete arrays.
+  std::map<uint8_t, const std::vector<unsigned char> *> concreteMap;
+  for (const auto &p : concreteArrays)
+    concreteMap[p.first] = &p.second;
 
   // 1. Discover all array names referenced anywhere in the key.
   std::set<std::string> namesSet;
@@ -110,10 +211,26 @@ ParsedKey OfflineEngine::parseKey(const std::set<std::string> &key) {
             });
 
   // 2. Synthesise a KQuery source: array decls + (query [...] false).
+  // Arrays present in concreteMap are declared with their concrete byte values;
+  // all others are declared symbolic with a fixed synthetic size.
   std::ostringstream src;
   for (const auto &name : names) {
-    src << "array " << name << '[' << kSyntheticArraySize
-        << "] : w32 -> w8 = symbolic\n";
+    unsigned nameIdx =
+        static_cast<unsigned>(std::strtoul(name.c_str() + 1, nullptr, 10));
+    auto it = concreteMap.find(static_cast<uint8_t>(nameIdx));
+    if (it != concreteMap.end()) {
+      const auto &bytes = *it->second;
+      src << "array " << name << '[' << bytes.size()
+          << "] : w32 -> w8 = [";
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        if (i > 0) src << ' ';
+        src << static_cast<unsigned>(bytes[i]);
+      }
+      src << "]\n";
+    } else {
+      src << "array " << name << '[' << kSyntheticArraySize
+          << "] : w32 -> w8 = symbolic\n";
+    }
   }
   src << "(query [";
   bool first = true;
@@ -200,20 +317,30 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
   if (n <= 1)
     return res;
 
-  // Precondition: the full set must be UNSAT (under symbolic-array
-  // reconstruction).  Otherwise the canonical key relied on concrete-array
-  // contents we cannot reconstruct, and shrinking would be unsound.
-  bool timedOut = false;
+  // Step 1: ask Z3 directly for an unsat core (single solver call).  This
+  // both checks the UNSAT precondition and, on success, shrinks the index
+  // set to typically a small subset.  Z3's core is not guaranteed minimal,
+  // so step 2 polishes it via delta-debugging.
   ++res.solverCalls;
-  if (!isUnsat(constraints, timedOut)) {
-    if (timedOut) res.timedOut = true;
-    else          res.notUnsatPrecondition = true;
+  UnsatCoreResult core = getUnsatCore(constraints);
+  if (core.timedOut) {
+    res.timedOut = true;
     return res;
   }
+  if (!core.ok) {
+    // SAT under symbolic-array reconstruction → canonical key relied on
+    // concrete-array contents we cannot reconstruct; shrinking would be
+    // unsound.  Caller should skip this entry.
+    res.notUnsatPrecondition = true;
+    return res;
+  }
+  res.keptIndices = std::move(core.coreIndices);
+  if (res.keptIndices.size() <= 1)
+    return res;
 
-  // Single-element delta-debugging: try removing one constraint at a time.
-  // If the residue is still UNSAT, accept the removal and re-scan from the
-  // current position (the removed element's "slot").  Otherwise advance.
+  // Step 2: delta-debug the (typically small) core to true minimality.
+  // Try removing one constraint at a time; if the residue is still UNSAT,
+  // accept the removal and re-scan from that slot.  Otherwise advance.
   std::vector<ref<Expr>> sub;
   sub.reserve(n);
   size_t i = 0;
