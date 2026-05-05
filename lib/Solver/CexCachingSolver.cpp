@@ -476,6 +476,18 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   auto [diskKey, canon] =
       buildConstraintDiskKey(vec, *logExprBuilder_, logArrayCache_);
 
+  // Canonical name indices are stored as uint8_t in both the SAT value blob
+  // (serializeAssignment) and the per-record concrete-arrays section below.
+  // serializeAssignment guards SAT, but UNSAT entries take the value="" path
+  // and bypass that guard — emit the same diagnostic here so log writes
+  // never silently truncate an index past 255.
+  if (canon.forwardArrayMap.size() > 255) {
+    klee_warning("appendToCacheLog: too many symbolic arrays (%zu) for "
+                 "binary format (max 255); skipping log entry",
+                 canon.forwardArrayMap.size());
+    return;
+  }
+
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
                         : ""; // empty = UNSAT sentinel
 
@@ -519,6 +531,19 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
     record.append(reinterpret_cast<const char *>(&len), 4);
     record.append(reinterpret_cast<const char *>(ce.bytes.data()), len);
   }
+
+  // POSIX guarantees write(O_APPEND) is atomic for sizes <= PIPE_BUF (4096
+  // on Linux).  Larger records may interleave with concurrent KLEE processes
+  // appending to the same log file.  We warn (rather than drop) so the data
+  // still lands; concurrent writers should serialise via flock if this
+  // becomes common.
+#ifdef PIPE_BUF
+  if (record.size() > PIPE_BUF)
+    klee_warning_once(nullptr,
+                      "CEX cache log: record size %zu exceeds PIPE_BUF (%d); "
+                      "concurrent writers may interleave records",
+                      record.size(), PIPE_BUF);
+#endif
 
   ssize_t written = write(logFd_, record.data(), record.size());
   if (written < 0 || static_cast<size_t>(written) != record.size())
