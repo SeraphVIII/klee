@@ -667,7 +667,21 @@ int main(int argc, char **argv) {
     std::set<std::set<std::string>> knownUnsatKeys;
     for (const auto &e : unsatEntries) knownUnsatKeys.insert(e.key_set);
 
-    // 3. Iterate unique pairs.  Use a deterministic ordered vector.
+    // 3. Materialise pair candidates sorted by descending array-overlap
+    //    weight (the size of the intersection of their canonical-array sets),
+    //    with lexicographic tiebreak on the (uniq[i], uniq[j]) pair.
+    //
+    //    Why descending overlap: under a tight --max-pair-calls budget, pairs
+    //    with more shared arrays are a priori more likely to interact.  A
+    //    plain lexicographic iteration (the previous behaviour, accidental
+    //    from std::map ordering) wastes the budget on alphabetically early
+    //    constraints regardless of solver-relevance.
+    //
+    //    Why lex tiebreak: makes the candidate sequence — and therefore which
+    //    pairs are explored under a budget cap, and the byte content of any
+    //    new UNSAT entries inserted into the result — deterministic across
+    //    runs.  Without it, ties resolve by std::sort's implementation-
+    //    defined choices.
     std::vector<std::string> uniq;
     uniq.reserve(stringArrays.size());
     for (auto &kv : stringArrays) uniq.push_back(kv.first);
@@ -675,35 +689,52 @@ int main(int argc, char **argv) {
     fprintf(stdout, "  Constraint universe       : %zu unique strings\n",
             uniq.size());
 
-    for (size_t i = 0; i < uniq.size() && pairsTried < maxPairCalls; ++i) {
+    struct PairCandidate {
+      size_t i, j;            // indices into uniq, with i < j
+      uint32_t overlapWeight; // |arrays(uniq[i]) ∩ arrays(uniq[j])|
+    };
+    std::vector<PairCandidate> candidates;
+    for (size_t i = 0; i < uniq.size(); ++i) {
       const auto &arrsA = stringArrays[uniq[i]];
-      for (size_t j = i + 1; j < uniq.size() && pairsTried < maxPairCalls; ++j) {
+      for (size_t j = i + 1; j < uniq.size(); ++j) {
         const auto &arrsB = stringArrays[uniq[j]];
+        uint32_t overlap = 0;
+        for (const auto &s : arrsA) if (arrsB.count(s)) ++overlap;
+        if (overlap == 0) { ++pairsSkippedNoOverlap; continue; }
+        candidates.push_back({i, j, overlap});
+      }
+    }
 
-        // Skip pairs whose arrays don't overlap — solver would just say SAT.
-        bool overlap = false;
-        for (const auto &s : arrsA) if (arrsB.count(s)) { overlap = true; break; }
-        if (!overlap) { ++pairsSkippedNoOverlap; continue; }
+    std::sort(candidates.begin(), candidates.end(),
+              [&](const PairCandidate &a, const PairCandidate &b) {
+                if (a.overlapWeight != b.overlapWeight)
+                  return a.overlapWeight > b.overlapWeight; // descending
+                int ci = uniq[a.i].compare(uniq[b.i]);
+                if (ci != 0) return ci < 0;
+                return uniq[a.j] < uniq[b.j];
+              });
 
-        std::set<std::string> key{uniq[i], uniq[j]};
-        if (knownUnsatKeys.count(key)) { ++pairsAlreadyKnown; continue; }
+    for (const auto &cand : candidates) {
+      if (pairsTried >= maxPairCalls) break;
 
-        ParsedKey pk = engine.parseKey(key);
-        if (!pk.ok) { ++pairsParseFail; continue; }
+      std::set<std::string> key{uniq[cand.i], uniq[cand.j]};
+      if (knownUnsatKeys.count(key)) { ++pairsAlreadyKnown; continue; }
 
-        bool to = false;
-        ++pairsTried;
-        bool unsat = engine.isUnsat(pk.constraints, to);
-        if (to) {
-          ++pairsTimeout;
-        } else if (unsat) {
-          ++pairsUnsat;
-          Entry e;
-          e.key_set = key;
-          e.value = ""; // UNSAT sentinel
-          unsatEntries.push_back(std::move(e));
-          knownUnsatKeys.insert(std::move(key));
-        }
+      ParsedKey pk = engine.parseKey(key);
+      if (!pk.ok) { ++pairsParseFail; continue; }
+
+      bool to = false;
+      ++pairsTried;
+      bool unsat = engine.isUnsat(pk.constraints, to);
+      if (to) {
+        ++pairsTimeout;
+      } else if (unsat) {
+        ++pairsUnsat;
+        Entry e;
+        e.key_set = key;
+        e.value = ""; // UNSAT sentinel
+        unsatEntries.push_back(std::move(e));
+        knownUnsatKeys.insert(std::move(key));
       }
     }
 
@@ -749,10 +780,14 @@ int main(int argc, char **argv) {
   // --- UNSAT entries ---------------------------------------------------------
 
   // Sort ascending by key_set size so that smaller (dominating) sets are
-  // processed before larger (dominated) sets.
+  // processed before larger (dominated) sets.  Lexicographic tiebreak on
+  // the key_set itself makes the iteration order — and therefore the output
+  // file's byte content — deterministic across runs (std::sort is unstable).
   std::sort(unsatEntries.begin(), unsatEntries.end(),
             [](const Entry &a, const Entry &b) {
-              return a.key_set.size() < b.key_set.size();
+              if (a.key_set.size() != b.key_set.size())
+                return a.key_set.size() < b.key_set.size();
+              return a.key_set < b.key_set;
             });
 
   // Separate incremental trie used only for subset queries during pruning.
