@@ -6,6 +6,15 @@
 #include <map>
 #include <set>
 
+// The on-disk format writes multi-byte integers (preamble, directory entries,
+// length prefixes in the values blob and string table) as raw native-byte-order
+// bytes via memcpy.  Until those sites are routed through explicit LE helpers,
+// the format is little-endian only; refuse to compile on big-endian hosts.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "MapOfSets file format requires a little-endian host");
+#endif
+
 using namespace klee;
 
 void MapOfSetsDiskBuilder::dfsAssign(const MapOfSetsDiskBuilder::UBTree::Node *src,
@@ -165,9 +174,15 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     lastSize = sz;
     finalHeaderBlob = std::move(tmp);
   }
-  if (!converged)
+  if (!converged) {
+    // Writing a non-converged header would produce a file whose declared
+    // offsets disagree with the byte layout — silently corrupt.  Better to
+    // not write at all; KLEE survives a missing cache file but not a
+    // mis-pointed one.
     klee_warning("MapOfSetsDiskBuilder: header offset fixed-point did not "
-                 "converge; output file '%s' may be corrupt", filename.c_str());
+                 "converge; aborting write to '%s'", filename.c_str());
+    return;
+  }
 
   uint64_t headerSize = finalHeaderBlob.size();
   uint64_t dirOffset  = kPreambleSize + headerSize;
