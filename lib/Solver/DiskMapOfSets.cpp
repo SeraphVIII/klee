@@ -40,6 +40,13 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   mmap_base_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0);
   if (mmap_base_ == MAP_FAILED) { fail("DiskMapOfSets: mmap failed"); return; }
 
+  // POSIX mmap semantics: once the mapping exists, the kernel keeps the
+  // underlying inode alive even if the fd is closed.  Close the fd now so
+  // we don't tie up a descriptor for the lifetime of this object — KLEE
+  // already manages many open files (test cases, log files, output files).
+  close(fd_);
+  fd_ = -1;
+
   // On-disk layout (v2):
   //   [u64 magic][u64 header_size][Header proto][directory][values][string table][chunks]
   static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
