@@ -1,5 +1,3 @@
-// DiskCexCache.cpp
-
 #include "klee/Solver/DiskCexCache.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Support/ErrorHandling.h"
@@ -11,10 +9,6 @@
 using namespace klee;
 using mapofsets::DiskMapOfSets;
 
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
-
 DiskCexCache::DiskCexCache(const std::string &filename,
                            const CacheMetadata &current)
     : disk_(filename), builder_(createDefaultExprBuilder()) {
@@ -24,10 +18,8 @@ DiskCexCache::DiskCexCache(const std::string &filename,
   const std::string &storedSolver  = disk_.solverBackend();
   const std::string &storedVersion = disk_.kleeVersion();
 
-  // Warn if the cache was written with a different solver backend.  SAT
-  // assignments are re-verified by Assignment::satisfies() so a stale hit is
-  // caught; UNSAT results are logically solver-agnostic.  We warn rather than
-  // reject so that a solver upgrade doesn't silently discard a large cache.
+  // Solver/version mismatch is non-fatal: SAT hits are re-verified by
+  // Assignment::satisfies(), UNSAT hits are solver-agnostic.
   if (!current.solverBackend.empty() && !storedSolver.empty() &&
       current.solverBackend != storedSolver)
     klee_warning("DiskCexCache: cache was written with solver '%s' "
@@ -41,26 +33,13 @@ DiskCexCache::DiskCexCache(const std::string &filename,
                  storedVersion.c_str(), current.kleeVersion.c_str());
 }
 
-// ---------------------------------------------------------------------------
-// Serialization (public static — used by the write path and tests)
-//
-// Binary value format (v2):
-//   SAT:  [u8 0x01][u8 n_arrays]
-//           ([u8 name_index][u32 data_len LE][data_len bytes]) × n_arrays
-//   UNSAT: empty string (zero-byte entry in the values blob)
-//
-// name_index is the integer suffix of canonical array name "A{n}".
-// ---------------------------------------------------------------------------
-
+// SAT v2: [u8 0x01][u8 n_arrays]([u8 idx][u32 len LE][bytes])×n
+// UNSAT:  empty string
 std::string DiskCexCache::serializeAssignment(
     const Assignment *a,
     const std::map<const Array *, const Array *> &forwardArrayMap) {
-  // Soft-fail: returning empty here aliases the UNSAT sentinel, which is wrong
-  // for a SAT record, so production callers must pre-check (CexCachingSolver
-  // ::appendToCacheLog does).  Defence in depth: warn and return "" rather
-  // than klee_error here so a future caller that forgets the upstream guard,
-  // or a unit test invoking this directly, does not bring down the whole
-  // KLEE process.
+  // Returning "" aliases the UNSAT sentinel, so production callers must
+  // pre-check; soft-fail here is defence in depth against direct callers.
   if (forwardArrayMap.size() > 255) {
     klee_warning_once(nullptr,
                       "serializeAssignment: too many symbolic arrays (%zu) "
@@ -76,11 +55,7 @@ std::string DiskCexCache::serializeAssignment(
   for (const auto &[orig, canon] : forwardArrayMap) {
     uint8_t idx = static_cast<uint8_t>(std::stoi(canon->name.substr(1)));
     auto it = a->bindings.find(orig);
-    // An array that appears in the constraint set but has no binding in the
-    // assignment is written with data_len=0.  This is distinct from the UNSAT
-    // sentinel (the entire value blob being absent): here we are inside a SAT
-    // record (marker byte 0x01 is present) and len=0 simply means the array
-    // was unconstrained in this particular assignment.
+    // An unbound array gets data_len=0; distinct from UNSAT (whole record empty).
     static const std::vector<unsigned char> empty;
     entries.push_back({idx, it != a->bindings.end() ? &it->second : &empty});
   }
@@ -99,11 +74,6 @@ std::string DiskCexCache::serializeAssignment(
   return out;
 }
 
-
-// ---------------------------------------------------------------------------
-// Value parsing
-// ---------------------------------------------------------------------------
-
 DiskCexCache::ParsedValue
 DiskCexCache::parseValue(const std::string &val) const {
   if (val.empty())
@@ -113,15 +83,10 @@ DiskCexCache::parseValue(const std::string &val) const {
   return {ValueKind::Unknown, ""};
 }
 
-// ---------------------------------------------------------------------------
-// Assignment deserialization
-// ---------------------------------------------------------------------------
-
 std::unique_ptr<Assignment>
 DiskCexCache::parseAssignmentData(
     const std::string &data,
     const std::map<std::string, const Array *> &nameToOrig) {
-  // Binary format: [0x01][n_arrays]([name_index][u32 data_len LE][bytes])×n
   if (data.size() < 2) return nullptr;
   uint8_t n_arrays = static_cast<uint8_t>(data[1]);
 
@@ -132,7 +97,7 @@ DiskCexCache::parseAssignmentData(
 
   size_t pos = 2;
   for (uint8_t i = 0; i < n_arrays; ++i) {
-    if (pos + 5 > data.size()) return nullptr; // need idx(1) + len(4)
+    if (pos + 5 > data.size()) return nullptr;
     uint8_t name_index = static_cast<uint8_t>(data[pos++]);
     uint32_t data_len = 0;
     memcpy(&data_len, &data[pos], 4); pos += 4;
@@ -148,15 +113,10 @@ DiskCexCache::parseAssignmentData(
     }
     pos += data_len;
   }
-  // Reject blobs with trailing bytes (defensive: catches future format drift).
   if (pos != data.size()) return nullptr;
 
   return std::make_unique<Assignment>(objects, values);
 }
-
-// ---------------------------------------------------------------------------
-// Entry selection
-// ---------------------------------------------------------------------------
 
 bool DiskCexCache::pickEntry(
     const std::vector<std::string> &values,
@@ -164,8 +124,6 @@ bool DiskCexCache::pickEntry(
     const std::set<ref<Expr>> &originalConstraints,
     bool unsatValid,
     Assignment *&outAssignment) {
-  // Build canonical_name -> original Array* once for all values in this call;
-  // all values share the same CanonicalizationResult.
   std::map<std::string, const Array *> nameToOrig;
   for (const auto &[orig, can] : canon.forwardArrayMap)
     nameToOrig[can->name] = orig;
@@ -174,17 +132,16 @@ bool DiskCexCache::pickEntry(
     ParsedValue pv = parseValue(val);
     switch (pv.kind) {
     case ValueKind::Unsat:
-      // An UNSAT subset proves the full set UNSAT; an UNSAT superset does not
-      // (the query has fewer constraints and may still be satisfiable).
+      // UNSAT is monotonic on supersets but not subsets, so only valid for
+      // subset queries (current set ⊇ stored set).
       if (unsatValid) {
         outAssignment = nullptr;
         return true;
       }
       break;
     case ValueKind::AssignmentData: {
-      // Allocate locally; only retain on success.  Rejecting candidates were
-      // previously leaked into ownedAssignments_, growing the heap unbounded
-      // over a long KLEE run.
+      // Retain only on success — rejected candidates die at end of scope to
+      // bound heap growth across long-running queries.
       auto a = parseAssignmentData(pv.satData, nameToOrig);
       if (a && a->satisfies(originalConstraints.begin(),
                             originalConstraints.end())) {
@@ -201,10 +158,6 @@ bool DiskCexCache::pickEntry(
   }
   return false;
 }
-
-// ---------------------------------------------------------------------------
-// Public interface
-// ---------------------------------------------------------------------------
 
 bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
                         bool trySuperset,

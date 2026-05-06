@@ -26,20 +26,16 @@ struct CanonicalizationResult {
   std::map<const Array *, const Array *> inverseArrayMap;
 };
 
-/// Canonicalize a single expression tree.
 klee::ref<Expr> canonicalizeExprTree(klee::ref<Expr> e);
 
-/// Canonicalize a whole constraint set.
 CanonicalizationResult
 canonicalizeConstraintSet(const std::vector<klee::ref<Expr>> &constraints,
                           ExprBuilder &builder,
                           ArrayCache &arrayCache);
 
-/// Build the disk lookup key (set of printed canonical constraint strings) and
-/// the full CanonicalizationResult in a single pass.  Both the read path
-/// (DiskCexCache) and the write path (CexCachingSolver) use identical key
-/// construction; this function is the single authoritative implementation so
-/// that any future change to the key format only needs to be made here.
+/// Single authoritative disk-key construction shared by the read and write
+/// paths; returns the set of printed canonical constraint strings plus the
+/// CanonicalizationResult that produced them.
 std::pair<std::set<std::string>, CanonicalizationResult>
 buildConstraintDiskKey(const std::vector<klee::ref<Expr>> &constraints,
                        ExprBuilder &builder,

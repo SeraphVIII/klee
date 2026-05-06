@@ -15,10 +15,8 @@ struct BuildNode {
   std::vector<std::pair<std::string, uint32_t>> children;
 };
 
-/// Informational metadata written into the cache file header.
-/// Stored for diagnostic purposes; a mismatch on load produces a warning
-/// but does not invalidate the cache (SAT assignments are re-verified by
-/// Assignment::satisfies(), and UNSAT results are logically solver-agnostic).
+/// Informational metadata stored in the file header; a mismatch on load
+/// only warns (cache stays valid).
 struct CacheMetadata {
   std::string solverBackend; ///< e.g. "z3", "stp"
   std::string kleeVersion;   ///< e.g. "KLEE 3.3-pre"

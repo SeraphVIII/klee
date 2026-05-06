@@ -139,20 +139,15 @@ class CexCachingSolver : public SolverImpl {
   // Disk cache support
   std::unique_ptr<DiskCexCache> diskCexCache_;
 
-  // Sliding-window hit-rate tracking.
-  // The window holds the last min(lookups, windowSize) hit(1)/miss(0) results.
-  // When the hit rate in the window falls below the threshold the disk cache is
-  // suspended; it is re-tried after windowSize consecutive skips so that a
-  // temporary bad patch does not permanently poison the cache.
-  std::vector<uint8_t> diskCacheWindow_;  // circular buffer, lazily sized
-  unsigned diskCacheWindowPos_  = 0;      // next write index
-  unsigned diskCacheWindowFill_ = 0;      // entries written so far (saturates at window size)
-  unsigned diskCacheWindowHits_ = 0;      // hits currently in window
-  uint64_t diskCacheSuspendedAt_ = 0;     // lookup count when last suspended (0 = active)
-  uint64_t diskCacheLookups_    = 0;      // total lookups (including suspended skips)
+  // Circular buffer of recent hit(1)/miss(0) outcomes; cache is suspended for
+  // W lookups when the hit rate in a full window falls below the threshold.
+  std::vector<uint8_t> diskCacheWindow_;
+  unsigned diskCacheWindowPos_  = 0;
+  unsigned diskCacheWindowFill_ = 0;
+  unsigned diskCacheWindowHits_ = 0;
+  uint64_t diskCacheSuspendedAt_ = 0;     // 0 = active
+  uint64_t diskCacheLookups_    = 0;
 
-  // Append-only log: new entries are written to a log file during the run.
-  // Canonicalization is done eagerly while Array objects are still alive.
   int logFd_ = -1;
   ArrayCache logArrayCache_;
   std::unique_ptr<ExprBuilder> logExprBuilder_;
@@ -273,7 +268,6 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
   }
 
   if (diskCexCache_) {
-    // Lazily size the window on first use so it reflects the CLI option value.
     if (diskCacheWindow_.empty()) {
       unsigned w = std::max(DiskCacheHitRateWindow.getValue(), 1u);
       diskCacheWindow_.assign(w, 0);
@@ -281,14 +275,8 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
 
     const unsigned W = static_cast<unsigned>(diskCacheWindow_.size());
 
-    // Count this lookup once, regardless of whether it goes through to the
-    // disk cache or short-circuits in the suspension branch.  The previous
-    // shape incremented in both branches and double-counted the lookup that
-    // straddles the suspend→active transition.
     ++diskCacheLookups_;
 
-    // If suspended, skip disk lookup until we have accumulated W more misses
-    // since suspension, then re-enable and give the cache another chance.
     if (diskCacheSuspendedAt_ != 0) {
       if (diskCacheLookups_ - diskCacheSuspendedAt_ >= W) {
         diskCacheSuspendedAt_ = 0;
@@ -310,9 +298,7 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
       ++stats::queryCexDiskCacheMisses;
     }
 
-    // Update sliding window.
     if (diskCacheWindowFill_ == W) {
-      // Evict oldest entry.
       diskCacheWindowHits_ -= diskCacheWindow_[diskCacheWindowPos_];
     } else {
       ++diskCacheWindowFill_;
@@ -326,7 +312,6 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
       return true;
     }
 
-    // Suspend if the window is full and the hit rate is below the threshold.
     if (DiskCacheMinHitRatePct > 0 && diskCacheWindowFill_ == W &&
         diskCacheWindowHits_ * 100 < W * DiskCacheMinHitRatePct) {
       diskCacheSuspendedAt_ = diskCacheLookups_;
@@ -374,8 +359,8 @@ bool CexCachingSolver::lookupAssignment(const Query &query,
 bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
   KeyType key;
   if (lookupAssignment(query, key, result)) {
-    // Promote disk hits into the in-memory cache to avoid repeated disk lookups.
-    // Do NOT add to assignmentsTable — that set owns and deletes its entries.
+    // Promote disk hits to in-memory; assignmentsTable owns its entries so do
+    // not add disk-owned pointers to it.
     if (diskCexCache_ && !cache.lookup(key))
       cache.insert(key, result);
     return true;
@@ -429,8 +414,7 @@ CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
                                    ? DiskCexCacheFile.getValue()
                                    : PersistentCexCacheFile.getValue();
 
-  // Determine log file path: --write-disk-cex-cache takes precedence,
-  // otherwise --persistent-cex-cache=X writes to X.log.
+  // --write-disk-cex-cache wins; else --persistent-cex-cache=X uses X.log.
   std::string logPath;
   if (!WriteDiskCexCacheFile.empty())
     logPath = WriteDiskCexCacheFile.getValue();
@@ -463,28 +447,17 @@ CexCachingSolver::~CexCachingSolver() {
     delete *it;
 }
 
-// Log record format:
-//   [u32 num_keys]
-//     ([u32 key_len][key_bytes]) × num_keys
-//   [u32 val_len]
-//   [val_bytes]
-//   [u32 num_concrete_arrays]
-//     ([u8 name_index][u32 data_len LE][data_len bytes]) × num_concrete_arrays
-//
-// name_index is the integer suffix of the canonical array name "A{n}".
-// num_concrete_arrays is 0 when all arrays in the entry are symbolic.
-// The offline merge tool reads these records sequentially and incorporates
-// them into the cache file via MapOfSetsDiskBuilder.
+// Log record:
+//   [u32 num_keys]([u32 key_len][key_bytes]) × num_keys
+//   [u32 val_len][val_bytes]
+//   [u32 num_concrete_arrays]([u8 idx][u32 len LE][bytes]) × num_concrete_arrays
 void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   std::vector<ref<Expr>> vec(key.begin(), key.end());
   auto [diskKey, canon] =
       buildConstraintDiskKey(vec, *logExprBuilder_, logArrayCache_);
 
-  // Canonical name indices are stored as uint8_t in both the SAT value blob
-  // (serializeAssignment) and the per-record concrete-arrays section below.
-  // serializeAssignment guards SAT, but UNSAT entries take the value="" path
-  // and bypass that guard — emit the same diagnostic here so log writes
-  // never silently truncate an index past 255.
+  // serializeAssignment guards the SAT path; mirror the cap here so the
+  // UNSAT (value="") path does not silently truncate uint8 indices past 255.
   if (canon.forwardArrayMap.size() > 255) {
     klee_warning("appendToCacheLog: too many symbolic arrays (%zu) for "
                  "binary format (max 255); skipping log entry",
@@ -493,10 +466,10 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   }
 
   std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
-                        : ""; // empty = UNSAT sentinel
+                        : ""; // UNSAT sentinel
 
-  // Collect concrete canonical arrays (those whose originals had known byte
-  // values), sorted by canonical index so the reader order is deterministic.
+  // Concrete-array entries are emitted in canonical-index order so the
+  // reader sees a deterministic stream.
   struct ConcreteEntry { uint8_t idx; std::vector<unsigned char> bytes; };
   std::vector<ConcreteEntry> concretes;
   for (const auto &[orig, canon_arr] : canon.forwardArrayMap) {
@@ -514,7 +487,6 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
               return x.idx < y.idx;
             });
 
-  // Build the record in a single buffer.
   std::string record;
   uint32_t numKeys = static_cast<uint32_t>(diskKey.size());
   record.append(reinterpret_cast<const char *>(&numKeys), 4);
@@ -536,11 +508,8 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
     record.append(reinterpret_cast<const char *>(ce.bytes.data()), len);
   }
 
-  // POSIX guarantees write(O_APPEND) is atomic for sizes <= PIPE_BUF (4096
-  // on Linux).  Larger records may interleave with concurrent KLEE processes
-  // appending to the same log file.  We warn (rather than drop) so the data
-  // still lands; concurrent writers should serialise via flock if this
-  // becomes common.
+  // O_APPEND atomicity holds only up to PIPE_BUF; warn (don't drop) so
+  // oversize records still land but interleaving risk is visible.
 #ifdef PIPE_BUF
   if (record.size() > PIPE_BUF)
     klee_warning_once(nullptr,

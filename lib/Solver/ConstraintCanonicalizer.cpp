@@ -12,24 +12,18 @@
 
 using namespace klee;
 
-///===----------------------------------------------------------------------===///
-/// ExprCanonicalOrder
-///===----------------------------------------------------------------------===///
-
 bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
                                           const ref<Expr> &b) const {
   if (a.get() == b.get()) return false;
   if (a->getKind() != b->getKind()) return a->getKind() < b->getKind();
   if (a->getWidth() != b->getWidth()) return a->getWidth() < b->getWidth();
 
-  // For constants, compare the value directly — fully deterministic.
   if (a->getKind() == Expr::Constant) {
     const ConstantExpr *ca = cast<ConstantExpr>(a);
     const ConstantExpr *cb = cast<ConstantExpr>(b);
     return ca->getAPValue().ult(cb->getAPValue());
   }
 
-  // For reads, compare array names then the index.
   if (a->getKind() == Expr::Read) {
     const ReadExpr *ra = cast<ReadExpr>(a);
     const ReadExpr *rb = cast<ReadExpr>(b);
@@ -46,19 +40,13 @@ bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
     if (operator()(a->getKid(i), b->getKid(i))) return true;
     if (operator()(b->getKid(i), a->getKid(i))) return false;
   }
-
-  // Truly structurally identical — not less-than.
   return false;
 }
 
-///===----------------------------------------------------------------------===///
-/// Alpha-renaming support
-///===----------------------------------------------------------------------===///
-
 namespace {
 
-// Assigns each Array a DFS first-appearance index for stable canonical names
-// (A0, A1, ...), independent of original array names or allocation order.
+// Assigns each Array a DFS first-appearance index, giving canonical names
+// A0, A1, ... independent of allocation order.
 class ArrayOrderCollector : public ExprVisitor {
   std::unordered_map<const Array *, unsigned> &order_;
   unsigned &nextIndex_;
@@ -82,8 +70,8 @@ public:
   }
 };
 
-// Rewrites ReadExprs to use canonical arrays (from forwardArrayMap / subst_),
-// including walking UpdateList chains so symbolic writes are substituted too.
+// Rewrites ReadExprs onto canonical arrays, walking UpdateList chains so
+// symbolic writes are substituted too.
 class ArraySubstitutionVisitor : public ExprVisitor {
   const std::map<const Array *, const Array *> &subst_;
 
@@ -96,14 +84,13 @@ public:
     const UpdateList &ul = re.updates;
     const Array *root = ul.root;
 
-    // Fast path: no substitution needed, let ExprVisitor handle the index.
     auto it = subst_.find(root);
     if (it == subst_.end() && !ul.head)
       return Action::doChildren();
 
     const Array *newRoot = (it != subst_.end()) ? it->second : root;
 
-    // Replay the update chain oldest-first (head is newest, so reverse it).
+    // ul.head is the newest update; reverse so extend() replays oldest-first.
     std::vector<ref<UpdateNode>> nodes;
     for (ref<UpdateNode> un = ul.head; un; un = un->next)
       nodes.push_back(un);
@@ -116,18 +103,12 @@ public:
       newUL.extend(newIdx, newVal);
     }
 
-    // Substitute inside the read index as well.
     ref<Expr> newIndex = visit(re.index);
-
     return Action::changeTo(ReadExpr::create(newUL, newIndex));
   }
 };
 
 } // anonymous namespace
-
-///===----------------------------------------------------------------------===///
-/// Expression tree canonicalization (static helpers)
-///===----------------------------------------------------------------------===///
 
 static bool isCommutativeKind(Expr::Kind k) {
   switch (k) {
@@ -147,61 +128,45 @@ static bool isCommutativeKind(Expr::Kind k) {
 static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
                                  const std::vector<ref<Expr>> &kids) {
   switch (orig->getKind()) {
-  // --- commutative / associative ---
   case Expr::Add:  return AddExpr::create(kids[0], kids[1]);
   case Expr::And:  return AndExpr::create(kids[0], kids[1]);
   case Expr::Or:   return OrExpr::create(kids[0], kids[1]);
   case Expr::Xor:  return XorExpr::create(kids[0], kids[1]);
   case Expr::Mul:  return MulExpr::create(kids[0], kids[1]);
   case Expr::Eq:   return EqExpr::create(kids[0], kids[1]);
-
-  // --- comparisons ---
   case Expr::Ne:   return NeExpr::create(kids[0], kids[1]);
   case Expr::Ult:  return UltExpr::create(kids[0], kids[1]);
   case Expr::Ule:  return UleExpr::create(kids[0], kids[1]);
   case Expr::Slt:  return SltExpr::create(kids[0], kids[1]);
   case Expr::Sle:  return SleExpr::create(kids[0], kids[1]);
-
-  // --- arithmetic ---
   case Expr::Sub:  return SubExpr::create(kids[0], kids[1]);
   case Expr::UDiv: return UDivExpr::create(kids[0], kids[1]);
   case Expr::SDiv: return SDivExpr::create(kids[0], kids[1]);
   case Expr::URem: return URemExpr::create(kids[0], kids[1]);
   case Expr::SRem: return SRemExpr::create(kids[0], kids[1]);
-
-  // --- shifts ---
   case Expr::Shl:  return ShlExpr::create(kids[0], kids[1]);
   case Expr::LShr: return LShrExpr::create(kids[0], kids[1]);
   case Expr::AShr: return AShrExpr::create(kids[0], kids[1]);
-
-  // --- casts ---
   case Expr::ZExt: return ZExtExpr::create(kids[0], orig->getWidth());
   case Expr::SExt: return SExtExpr::create(kids[0], orig->getWidth());
-
-  // --- misc ---
   case Expr::Select:
     return SelectExpr::create(kids[0], kids[1], kids[2]);
   case Expr::Concat:
     return ConcatExpr::create(kids[0], kids[1]);
   case Expr::Extract: {
-    // Extract carries offset and width as metadata, not kids.
+    // Extract carries offset/width as metadata, not kids.
     const ExtractExpr *ee = cast<ExtractExpr>(orig);
     return ExtractExpr::create(kids[0], ee->offset, ee->width);
   }
-
-  // --- leaves (should not reach here since getNumKids()==0) ---
   case Expr::Constant:
   case Expr::Read:
-    // ReadExpr kids are only the index; update list is handled separately
-    // by ArraySubstitutionVisitor — do not rebuild here.
+    // ReadExpr's update list is rewritten by ArraySubstitutionVisitor.
     return orig;
-
   default:
     llvm_unreachable("rebuildWithKids: unhandled expression kind");
   }
 }
 
-// Only called for commutative/associative kinds, so the list is short.
 static ref<Expr> rebuildWithKind(Expr::Kind k,
                                  const ref<Expr> &a,
                                  const ref<Expr> &b) {
@@ -225,9 +190,8 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   Expr::Kind k = e->getKind();
   ExprCanonicalOrder cmp;
 
-  // Eq and Ne are commutative but NOT associative: flattening
-  // Eq(Eq(a,b), c) into {a,b,c} would mix expression widths.
-  // Just sort the two children for a canonical argument order.
+  // Eq/Ne are commutative but not associative — flattening across them
+  // would mix widths. Just sort the two children.
   if (k == Expr::Eq || k == Expr::Ne) {
     assert(e->getNumKids() == 2);
     ref<Expr> a = e->getKid(0), b = e->getKid(1);
@@ -265,10 +229,6 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   return elems[0];
 }
 
-///===----------------------------------------------------------------------===///
-/// Public API — all inside namespace klee so symbols match the header
-///===----------------------------------------------------------------------===///
-
 namespace klee {
 
 ref<Expr> canonicalizeExprTree(ref<Expr> e) {
@@ -300,9 +260,8 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   res.constraints = constraints;
 
   ExprCanonicalOrder cmp;
-  // First sort: establish a deterministic DFS encounter order for arrays so
-  // that the first-seen array gets canonical name A0, the second A1, etc.
-  // The ordering of constraints here drives which array gets which index.
+  // Sort first so the DFS encounter order — which drives canonical name
+  // assignment — is itself pointer-independent.
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   std::unordered_map<const Array *, unsigned> order;
@@ -339,10 +298,7 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   for (auto &e : res.constraints)
     e = canonicalizeExprTree(e);
 
-  // Second sort: array renaming (A0, A1, ...) and expression-tree
-  // canonicalization can both change expression structure, which may alter
-  // their relative order under ExprCanonicalOrder.  Re-sort to restore the
-  // canonical ordering before the constraints are serialized into disk keys.
+  // Renaming and tree canonicalization can perturb the relative order; re-sort.
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
 
   return res;

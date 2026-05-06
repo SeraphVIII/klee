@@ -1,5 +1,3 @@
-// DiskCexCache.h
-
 #ifndef DISK_CEX_CACHE_H
 #define DISK_CEX_CACHE_H
 
@@ -28,26 +26,20 @@ public:
   serializeAssignment(const Assignment *a,
                       const std::map<const Array *, const Array *> &forwardArrayMap);
 
-  /// Open a disk cache file for reading.
-  /// `current` describes the running KLEE instance; if the file was written
-  /// with different metadata a warning is emitted (the cache is still used
-  /// since SAT assignments are re-verified and UNSAT results are solver-agnostic).
+  /// `current` describes the running KLEE; metadata mismatch is non-fatal
+  /// (warns only — SAT is re-verified, UNSAT is solver-agnostic).
   explicit DiskCexCache(const std::string &filename,
                         const CacheMetadata &current = {});
 
-  /// Try to find a cached result for `constraints`, checking supersets first
-  /// (if trySuperset is true) then subsets, with a single canonicalization.
-  /// Returns true on hit; outAssignment is non-nullptr for SAT, nullptr for UNSAT.
+  /// Look up a cached result, checking supersets first (when trySuperset)
+  /// then subsets.  outAssignment is non-null for SAT, null for UNSAT.
   bool find(const std::set<ref<Expr>> &constraints,
             bool trySuperset,
             Assignment *&outAssignment);
 
-  /// Try to find a cached SAT assignment for a superset of `constraints`.
-  /// Returns true on hit; outAssignment is non-nullptr for SAT, nullptr for UNSAT.
   bool findSuperset(const std::set<ref<Expr>> &constraints,
                     Assignment *&outAssignment);
 
-  /// Try to find a cached SAT assignment for a subset of `constraints`.
   bool findSubset(const std::set<ref<Expr>> &constraints,
                   Assignment *&outAssignment);
 
@@ -55,35 +47,27 @@ private:
   mapofsets::DiskMapOfSets disk_;
   std::unique_ptr<ExprBuilder> builder_;
   mutable ArrayCache arrayCache_;
-  /// Owns Assignment objects reconstructed from disk. Raw pointers returned
-  /// by findSuperset/findSubset remain valid for the lifetime of this object.
+  // Owns reconstructed Assignments; raw pointers returned via outAssignment
+  // alias entries here and stay valid for the lifetime of this object.
   std::vector<std::unique_ptr<Assignment>> ownedAssignments_;
 
-  enum class ValueKind {
-    Unsat,          ///< empty value: UNSAT sentinel
-    AssignmentData, ///< starts with 0x01: inline binary assignment
-    Unknown         ///< unrecognised format, treat as miss
-  };
+  enum class ValueKind { Unsat, AssignmentData, Unknown };
 
   struct ParsedValue {
     ValueKind kind;
-    std::string satData; // valid iff kind == AssignmentData
+    std::string satData;
   };
 
   ParsedValue parseValue(const std::string &val) const;
 
-  /// Returns nullptr on parse failure.  Caller decides ownership: retain by
-  /// moving into `ownedAssignments_` (and exposing `.get()` to consumers) or
-  /// let it die at end of scope.  We don't push into `ownedAssignments_`
-  /// here because pickEntry typically parses several candidates per lookup
-  /// and only keeps the first that satisfies the live constraints.
+  // Caller chooses ownership: retain by moving into ownedAssignments_, else
+  // the unique_ptr dies at end of scope. pickEntry retains only on a hit.
   std::unique_ptr<Assignment> parseAssignmentData(
       const std::string &data,
       const std::map<std::string, const Array *> &nameToOrig);
 
-  // unsatValid: true when values come from subset queries (an UNSAT subset
-  // proves the full set UNSAT); false for superset queries (an UNSAT superset
-  // says nothing about the subset — only SAT superset assignments are usable).
+  // unsatValid is true for subset queries (UNSAT subset ⇒ UNSAT) and false
+  // for superset queries (UNSAT superset says nothing about the subset).
   bool pickEntry(const std::vector<std::string> &values,
                  const CanonicalizationResult &canon,
                  const std::set<ref<Expr>> &originalConstraints,

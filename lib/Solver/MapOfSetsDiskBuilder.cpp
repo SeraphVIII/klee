@@ -6,10 +6,8 @@
 #include <map>
 #include <set>
 
-// The on-disk format writes multi-byte integers (preamble, directory entries,
-// length prefixes in the values blob and string table) as raw native-byte-order
-// bytes via memcpy.  Until those sites are routed through explicit LE helpers,
-// the format is little-endian only; refuse to compile on big-endian hosts.
+// Multi-byte integers are written via raw memcpy; LE-only until routed
+// through explicit byte-order helpers.
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "MapOfSets file format requires a little-endian host");
@@ -39,34 +37,19 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
                                  const std::string &filename,
                                  const CacheMetadata &metadata,
                                  uint32_t chunkSize) {
-  // -------------------------------------------------------------------------
-  // On-disk layout (v2):
-  //   [u64 magic][u64 header_size][Header proto bytes]
-  //   [directory: numChunks * 12 bytes]
-  //   [values blob]
-  //   [string table blob]
-  //   [chunk protobufs...]
-  //
-  // String table: [u32 count]([u32 len][bytes])×count  (sorted strings).
-  // Child.key_index is an index into this table.
-  // Values blob entries: [u32 len][bytes]; len=0 means UNSAT.
-  // -------------------------------------------------------------------------
   static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
   const uint64_t kPreambleSize = 16; // magic + header_size
 
-  // 1. Extract nodes in stable DFS order.
   std::vector<BuildNode> nodes;
   nodes.reserve(1024);
   dfsAssign(&tree.root, nodes);
   uint32_t totalNodes = static_cast<uint32_t>(nodes.size());
 
-  // 2. Build string table: collect all unique edge keys, sort, assign indices.
   std::set<std::string> uniqueKeys;
   for (const auto &bn : nodes)
     for (const auto &kv : bn.children)
       uniqueKeys.insert(kv.first);
 
-  // std::set iteration is sorted, so this vector is sorted.
   std::vector<std::string> strings(uniqueKeys.begin(), uniqueKeys.end());
 
   std::map<std::string, uint32_t> stringIndex;
@@ -82,9 +65,7 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     stringTableBlob.append(s);
   }
 
-  // 3. Build values blob and record per-node offsets.
-  //    Stored as offset+1 so that 0 means "no value".
-  //    An empty value (len=0) represents UNSAT.
+  // Values stored as offset+1 so 0 doubles as "no value"; len=0 means UNSAT.
   std::string valuesBlob;
   std::vector<uint64_t> valueOffsets(totalNodes, 0);
   for (const auto &bn : nodes) {
@@ -97,11 +78,9 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     valueOffsets[bn.id] = offset + 1;
   }
 
-  // 4. Compute directory size (fixed regardless of header size).
   uint32_t numChunks = (totalNodes + chunkSize - 1) / chunkSize;
-  uint64_t dirSize = numChunks * 12ULL; // uint64 offset + uint32 size per entry
+  uint64_t dirSize = numChunks * 12ULL; // u64 offset + u32 size per entry
 
-  // 5. Build chunk protobufs using key_index instead of raw key bytes.
   std::vector<std::string> chunkBuffers(numChunks);
   for (uint32_t c = 0; c < numChunks; ++c) {
     uint32_t first = c * chunkSize;
@@ -126,14 +105,12 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     chunkMsg.SerializeToString(&chunkBuffers[c]);
   }
 
-  // 6. Build the header protobuf. All offsets depend on the serialised header
-  //    size (varint encoding), so converge with a fixed-point loop.
   mapofsets::MapOfSetsFile file;
   mapofsets::Header *hdr = file.mutable_header();
   hdr->set_magic(kRawMagic);
   hdr->set_version(1);
-  // Increment kCanonVersion whenever the canonicalization algorithm or key
-  // serialization format changes so that readers can reject stale cache files.
+  // Bump on any canonicalization or key-serialization change so readers
+  // reject stale cache files.
   static constexpr uint32_t kCanonVersion = 1;
   hdr->set_canonicalization_version(kCanonVersion);
   if (!metadata.solverBackend.empty())
@@ -147,10 +124,8 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   hdr->set_values_size(valuesBlob.size());
   hdr->set_string_table_size(stringTableBlob.size());
 
-  // The serialized header size affects its own field offsets (protobuf uses
-  // varint encoding, so a larger offset value can grow the blob).  We iterate
-  // until the serialized size stabilises — in practice this converges in 1-2
-  // iterations because varint growth is bounded and the offsets only grow once.
+  // Header offsets feed back into the header's own serialised size via varint
+  // encoding; iterate until size is stable (1–2 iterations on real inputs).
   std::string finalHeaderBlob;
   uint64_t lastSize = 0;
   bool converged = false;
@@ -175,10 +150,8 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
     finalHeaderBlob = std::move(tmp);
   }
   if (!converged) {
-    // Writing a non-converged header would produce a file whose declared
-    // offsets disagree with the byte layout — silently corrupt.  Better to
-    // not write at all; KLEE survives a missing cache file but not a
-    // mis-pointed one.
+    // A non-converged header would point at the wrong byte offsets — refuse
+    // to write rather than emit a silently-corrupt file.
     klee_warning("MapOfSetsDiskBuilder: header offset fixed-point did not "
                  "converge; aborting write to '%s'", filename.c_str());
     return;
@@ -190,8 +163,7 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   uint64_t strOffset  = valOffset + valuesBlob.size();
   uint64_t chunkStart = strOffset + stringTableBlob.size();
 
-  // 7. Write file atomically: write to a temp path, then rename into place.
-  // rename() is atomic on POSIX — the destination is never partially written.
+  // Atomic publish via temp+rename (POSIX rename is atomic).
   std::string tmpPath = filename + ".tmp";
   {
     std::ofstream out(tmpPath, std::ios::binary);
@@ -200,12 +172,10 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
       return;
     }
 
-    // Preamble
     out.write(reinterpret_cast<const char *>(&kRawMagic), sizeof(uint64_t));
     out.write(reinterpret_cast<const char *>(&headerSize), sizeof(uint64_t));
-    // Header protobuf
     out.write(finalHeaderBlob.data(), finalHeaderBlob.size());
-    // Directory: (u64 offset, u32 size) per chunk
+
     uint64_t curChunkOffset = chunkStart;
     for (const auto &buf : chunkBuffers) {
       out.write(reinterpret_cast<const char *>(&curChunkOffset), sizeof(uint64_t));
@@ -213,11 +183,9 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
       out.write(reinterpret_cast<const char *>(&sz), sizeof(uint32_t));
       curChunkOffset += sz;
     }
-    // Values blob
+
     out.write(valuesBlob.data(), valuesBlob.size());
-    // String table
     out.write(stringTableBlob.data(), stringTableBlob.size());
-    // Chunk protobufs
     for (const auto &buf : chunkBuffers)
       out.write(buf.data(), buf.size());
 
@@ -228,7 +196,7 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
       std::remove(tmpPath.c_str());
       return;
     }
-  } // ofstream flushed and closed by destructor
+  }
 
   if (std::rename(tmpPath.c_str(), filename.c_str()) != 0) {
     klee_warning("MapOfSetsDiskBuilder: rename '%s' -> '%s' failed",

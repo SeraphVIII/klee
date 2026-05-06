@@ -7,38 +7,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// klee-pcache-opt: Offline optimiser for KLEE persistent solver caches.
-//
-// Reads a cache file (MapOfSets v2 format) and/or one or more log files
-// produced by KLEE's --write-disk-cex-cache / --persistent-cex-cache flags,
-// applies solver-free optimisations, and writes a compacted output cache file.
-//
-// Log file format (produced by CexCachingSolver::appendToCacheLog):
-//   record₁ record₂ ... recordₙ
-//   Each record:
-//     [u32 num_keys]
-//       ([u32 key_len][key_bytes]) × num_keys
-//     [u32 val_len]
-//     [val_bytes]
-//
-// Optimisations (all enabled by default):
-//
-//   UNSAT dominance pruning
-//     For two UNSAT entries A and B where A.key_set ⊂ B.key_set, entry B is
-//     redundant: any lookup whose constraint set is a superset of B.key_set is
-//     also a superset of A.key_set, so A will always be found first.  B can
-//     therefore be removed without affecting cache behaviour.
-//     Algorithm: process entries in ascending key_set-size order; build an
-//     incremental UNSAT trie; skip any entry whose key_set already has a
-//     stored UNSAT subset in the trie.
-//
-//   Deduplication
-//     Multiple entries with the same key_set are collapsed to one.  For
-//     SAT/UNSAT conflicts at the same key_set (cache corruption), UNSAT wins.
-//
-// SAT entries are not pruned: verifying whether a stored assignment still
-// satisfies a different query requires the original constraint objects and is
-// therefore outside the scope of solver-free processing.
+// Offline optimiser for KLEE persistent solver caches.  Merges a cache file
+// and/or log files, optionally applies solver-backed transformation passes,
+// and rewrites the result.  See offline_optimiser_design.md for the design
+// rationale and pass semantics.
 //
 //===----------------------------------------------------------------------===//
 
@@ -64,19 +36,10 @@ using namespace klee::mapofsets;
 using klee_pcache_opt::OfflineEngine;
 using klee_pcache_opt::ParsedKey;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 static bool isUnsat(const std::string &value) { return value.empty(); }
 
-// ---------------------------------------------------------------------------
-// SAT value-blob helpers (format mirrors DiskCexCache::serializeAssignment)
-//
-// SAT v2 blob: [u8 0x01][u8 n_arrays]
-//                ([u8 name_index][u32 data_len LE][data_len bytes]) × n_arrays
-// ---------------------------------------------------------------------------
-
+// SAT v2 blob: [u8 0x01][u8 n_arrays]([u8 idx][u32 len LE][bytes]) × n
+// (mirrors DiskCexCache::serializeAssignment).
 struct ValueArray {
   std::uint8_t nameIndex;
   std::vector<unsigned char> bytes;
@@ -143,15 +106,12 @@ struct Conflict {
 struct LogEntry {
   std::set<std::string> key_set;
   std::string value;
-  // Concrete canonical arrays: (name_index, byte_values).
-  // Populated from the log record's concrete-arrays section; empty if all
-  // arrays in the entry were symbolic.
+  // (name_index, bytes) per concrete canonical array; empty if all symbolic.
   std::vector<std::pair<uint8_t, std::vector<unsigned char>>> concreteArrays;
 };
 
-/// Read all records from a CEX cache log file.
-/// Returns the number of records read; partial trailing records (from a crash)
-/// are silently discarded.
+// Returns the number of records read; partial trailing records (from a crash
+// or interleaved write) are silently discarded.
 static size_t readLogFile(const std::string &path,
                           std::vector<LogEntry> &out) {
   int fd = open(path.c_str(), O_RDONLY);
@@ -177,7 +137,6 @@ static size_t readLogFile(const std::string &path,
   size_t count = 0;
 
   while (pos + 4 <= fileSize) {
-    // Read num_keys
     uint32_t numKeys = 0;
     memcpy(&numKeys, &buf[pos], 4);
     pos += 4;
@@ -204,7 +163,6 @@ static size_t readLogFile(const std::string &path,
     std::string value(&buf[pos], vlen);
     pos += vlen;
 
-    // Read concrete arrays section.
     if (pos + 4 > fileSize) break;
     uint32_t numConcrete = 0;
     memcpy(&numConcrete, &buf[pos], 4);
@@ -265,6 +223,10 @@ static void printUsage(const char *prog) {
       "  -h, --help             Show this help\n",
       prog);
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Main
@@ -353,7 +315,6 @@ int main(int argc, char **argv) {
   std::vector<Entry> unsatEntries, satEntries;
   std::string storedSolver, storedVersion;
 
-  // Read existing cache file (if provided)
   if (!inputPath.empty()) {
     DiskMapOfSets disk(inputPath, /*max_cache_size=*/200);
     if (!disk.isValid()) {
@@ -375,7 +336,6 @@ int main(int argc, char **argv) {
             inputPath.c_str(), unsatEntries.size() + satEntries.size());
   }
 
-  // Read log files
   for (const auto &logPath : logPaths) {
     std::vector<LogEntry> logEntries;
     size_t n = readLogFile(logPath, logEntries);
@@ -391,19 +351,15 @@ int main(int argc, char **argv) {
     fprintf(stdout, "Log file     : %s  (%zu records)\n", logPath.c_str(), n);
   }
 
-  // Snapshot the input counts before any pass mutates the vectors.
   const size_t inputUnsat = unsatEntries.size();
   const size_t inputSat   = satEntries.size();
   const size_t inputTotal = inputUnsat + inputSat;
-  // `unsatIn` / `satIn` track the pre-insert sizes (i.e. after passes 1-4)
-  // so the dominance/dedup percentages downstream are correct.
+  // unsatIn/satIn are the post-pass sizes used for downstream percentages.
   size_t unsatIn = inputUnsat;
   size_t satIn   = inputSat;
 
-  // -------------------------------------------------------------------------
-  // UNSAT core minimisation (Pass 1) — optional, requires solver
-  // -------------------------------------------------------------------------
-
+  // ------------------------------ Pass 1 ------------------------------------
+  // UNSAT core minimisation (solver).
   size_t minimizedEntries        = 0;
   size_t totalConstraintsRemoved = 0;
   size_t minimizeSkippedNotUnsat = 0;
@@ -421,8 +377,7 @@ int main(int argc, char **argv) {
       auto &e = unsatEntries[i];
       if (e.key_set.size() <= 1) continue;
 
-      // Snapshot the canonical key strings in their lex (set iteration) order;
-      // this matches the order parseKey emits constraints in.
+      // set iteration order matches parseKey's emission order.
       std::vector<std::string> orderedKeys(e.key_set.begin(), e.key_set.end());
 
       ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
@@ -433,7 +388,7 @@ int main(int argc, char **argv) {
       minimizeSolverCalls += mr.solverCalls;
       if (mr.notUnsatPrecondition) { ++minimizeSkippedNotUnsat; continue; }
       if (mr.timedOut)             { ++minimizeSkippedTimeout;  /* fall through */ }
-      if (mr.keptIndices.size() == orderedKeys.size()) continue; // already minimal
+      if (mr.keptIndices.size() == orderedKeys.size()) continue;
 
       std::set<std::string> shrunk;
       for (size_t k : mr.keptIndices)
@@ -457,10 +412,8 @@ int main(int argc, char **argv) {
     fprintf(stdout, "  Solver calls              : %zu\n", minimizeSolverCalls);
   }
 
-  // -------------------------------------------------------------------------
-  // SAT independence splitting (Pass 2) — optional, parser-only, no solver
-  // -------------------------------------------------------------------------
-
+  // ------------------------------ Pass 2 ------------------------------------
+  // SAT independence splitting (parser-only).
   size_t splitInputEntries  = 0;
   size_t splitOutputEntries = 0;
   size_t splitSkippedParse  = 0;
@@ -469,7 +422,7 @@ int main(int argc, char **argv) {
 
   if (splitIndependent && !satEntries.empty()) {
     fprintf(stdout, "\nSplitting independent SAT entries...\n");
-    OfflineEngine engine(0); // parser only, no solver invoked
+    OfflineEngine engine(0);
 
     std::vector<Entry> newSat;
     newSat.reserve(satEntries.size());
@@ -477,7 +430,6 @@ int main(int argc, char **argv) {
     for (auto &e : satEntries) {
       if (e.key_set.size() <= 1) { newSat.push_back(std::move(e)); continue; }
 
-      // Snapshot key strings in iteration order (matches parser output order).
       std::vector<std::string> orderedKeys(e.key_set.begin(), e.key_set.end());
 
       ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
@@ -490,18 +442,16 @@ int main(int argc, char **argv) {
       auto comps = engine.computeByteComponents(pk.constraints);
       if (comps.size() <= 1) { newSat.push_back(std::move(e)); continue; }
 
-      // Parse the stored value blob into per-array byte vectors.
       std::vector<ValueArray> origArrays;
       if (!parseSatValue(e.value, origArrays)) {
         ++splitSkippedBlob;
         newSat.push_back(std::move(e));
         continue;
       }
-      // name_index → ptr for fast lookup
       std::map<std::uint8_t, const ValueArray *> byIdx;
       for (const auto &va : origArrays) byIdx[va.nameIndex] = &va;
 
-      // Validate: every component-required array must be present in the blob.
+      // Every array referenced by a component must exist in the blob.
       bool ok = true;
       for (const auto &comp : comps) {
         for (const auto &name : comp.arrayNames) {
@@ -529,12 +479,10 @@ int main(int argc, char **argv) {
         for (const auto &name : comp.arrayNames) {
           int idx = arrayNameIndex(name);
           const ValueArray *src = byIdx[static_cast<std::uint8_t>(idx)];
-          // KLEE's IndependentSolver asserts that two assignments for the
-          // same array produce the same byte count.  Truncating to the
-          // component's coverage breaks that invariant when the value is
-          // later mixed with a fresh full-size Z3 result.  So duplicate the
-          // full original bytes into each sub-blob; the only saving from
-          // splitting is on the *key* side, not the value side.
+          // Copy the full byte vector: IndependentSolver asserts matching
+          // byte counts across assignments for the same array, so byte-level
+          // truncation is unsound here. Splitting saves space on the key
+          // side only.
           ValueArray va;
           va.nameIndex = static_cast<std::uint8_t>(idx);
           va.bytes = src->bytes;
@@ -556,23 +504,13 @@ int main(int argc, char **argv) {
     fprintf(stdout, "  Skipped (parse failure)   : %zu\n", splitSkippedParse);
     fprintf(stdout, "  Skipped (bad value blob)  : %zu\n", splitSkippedBlob);
     fprintf(stdout, "  Skipped (missing arrays)  : %zu\n", splitSkippedShape);
-    satIn = satEntries.size(); // reflect new entries in subsequent stats
+    satIn = satEntries.size();
   }
 
-  // -------------------------------------------------------------------------
-  // SAT witness compaction (Pass 3) — parser-only, no solver
-  //
-  // The original plan was to truncate each array's byte count down to the
-  // entry's referenced byte coverage.  That turned out to be UNSOUND for
-  // KLEE consumption: IndependentSolver::computeInitialValues asserts that
-  // two assignments for the same array have matching byte counts, and a
-  // truncated cache hit mixed with a fresh full-size Z3 result trips the
-  // assert.  The only safe compaction is to *drop arrays the entry's
-  // constraints don't reference at all* — those bindings come from the
-  // original witness containing extra arrays and are pure bloat for this
-  // entry's lookups.  We do NOT truncate bytes of referenced arrays.
-  // -------------------------------------------------------------------------
-
+  // ------------------------------ Pass 3 ------------------------------------
+  // SAT witness compaction (parser-only).  Drops only entire unreferenced
+  // arrays — byte-level truncation of a referenced array is unsound (see
+  // IndependentSolver byte-count assertion).
   size_t compactScanned     = 0;
   size_t compactShrunk      = 0;
   size_t compactBytesSaved  = 0;
@@ -590,7 +528,6 @@ int main(int argc, char **argv) {
       ParsedKey pk = engine.parseKey(e.key_set, e.concreteArrays);
       if (!pk.ok) { ++compactSkippedParse; continue; }
 
-      // Collect every array name that any constraint in the key references.
       auto comps = engine.computeByteComponents(pk.constraints);
       std::set<std::string> referenced;
       for (const auto &comp : comps)
@@ -610,9 +547,8 @@ int main(int argc, char **argv) {
         std::string name = "A" + std::to_string(va.nameIndex);
         if (referenced.count(name))
           kept.push_back(std::move(va));
-        // else: drop unreferenced array binding entirely.
       }
-      if (kept.size() == arrays.size()) continue; // no array dropped
+      if (kept.size() == arrays.size()) continue;
 
       e.value = serializeSatValue(kept);
       ++compactShrunk;
@@ -628,17 +564,8 @@ int main(int argc, char **argv) {
       fprintf(stdout, "  Skipped (bad value blob)  : %zu\n", compactSkippedBlob);
   }
 
-  // -------------------------------------------------------------------------
-  // UNSAT pair discovery (Pass 4) — solver-heavy, optional
-  //
-  // Across the entire cache, look at all unique constraint strings.  Cluster
-  // them by shared canonical array names — only constraints that touch the
-  // same arrays can possibly contradict.  For each within-cluster pair, ask
-  // the solver whether the pair is UNSAT.  New UNSAT pairs are added as
-  // fresh 2-element entries, which after dominance pruning will subsume any
-  // larger UNSAT entries containing both.
-  // -------------------------------------------------------------------------
-
+  // ------------------------------ Pass 4 ------------------------------------
+  // UNSAT pair discovery (solver-heavy).
   size_t pairsTried = 0, pairsSkippedNoOverlap = 0, pairsAlreadyKnown = 0;
   size_t pairsUnsat = 0, pairsTimeout = 0, pairsParseFail = 0;
 
@@ -647,7 +574,6 @@ int main(int argc, char **argv) {
             solverTimeoutSec, maxPairCalls);
     OfflineEngine engine(solverTimeoutSec);
 
-    // 1. Gather unique constraint strings + their array sets.
     std::map<std::string, std::set<std::string>> stringArrays;
     auto collectFrom = [&](const std::vector<Entry> &es) {
       for (const auto &e : es)
@@ -663,25 +589,12 @@ int main(int argc, char **argv) {
     collectFrom(unsatEntries);
     collectFrom(satEntries);
 
-    // 2. Index existing UNSAT keys so we don't re-emit known pairs.
     std::set<std::set<std::string>> knownUnsatKeys;
     for (const auto &e : unsatEntries) knownUnsatKeys.insert(e.key_set);
 
-    // 3. Materialise pair candidates sorted by descending array-overlap
-    //    weight (the size of the intersection of their canonical-array sets),
-    //    with lexicographic tiebreak on the (uniq[i], uniq[j]) pair.
-    //
-    //    Why descending overlap: under a tight --max-pair-calls budget, pairs
-    //    with more shared arrays are a priori more likely to interact.  A
-    //    plain lexicographic iteration (the previous behaviour, accidental
-    //    from std::map ordering) wastes the budget on alphabetically early
-    //    constraints regardless of solver-relevance.
-    //
-    //    Why lex tiebreak: makes the candidate sequence — and therefore which
-    //    pairs are explored under a budget cap, and the byte content of any
-    //    new UNSAT entries inserted into the result — deterministic across
-    //    runs.  Without it, ties resolve by std::sort's implementation-
-    //    defined choices.
+    // Sort candidates by descending array-overlap weight (with lex tiebreak)
+    // so the budget is spent on the most likely-to-interact pairs first, and
+    // the iteration order is deterministic across runs.
     std::vector<std::string> uniq;
     uniq.reserve(stringArrays.size());
     for (auto &kv : stringArrays) uniq.push_back(kv.first);
@@ -690,8 +603,8 @@ int main(int argc, char **argv) {
             uniq.size());
 
     struct PairCandidate {
-      size_t i, j;            // indices into uniq, with i < j
-      uint32_t overlapWeight; // |arrays(uniq[i]) ∩ arrays(uniq[j])|
+      size_t i, j;
+      uint32_t overlapWeight;
     };
     std::vector<PairCandidate> candidates;
     for (size_t i = 0; i < uniq.size(); ++i) {
@@ -732,7 +645,7 @@ int main(int argc, char **argv) {
         ++pairsUnsat;
         Entry e;
         e.key_set = key;
-        e.value = ""; // UNSAT sentinel
+        e.value = "";
         unsatEntries.push_back(std::move(e));
         knownUnsatKeys.insert(std::move(key));
       }
@@ -745,12 +658,10 @@ int main(int argc, char **argv) {
     fprintf(stdout, "  Pairs timed out           : %zu\n", pairsTimeout);
     if (pairsParseFail > 0)
       fprintf(stdout, "  Pairs parse failed        : %zu\n", pairsParseFail);
-    unsatIn = unsatEntries.size(); // include newly-discovered pairs
+    unsatIn = unsatEntries.size();
   }
 
-  // -------------------------------------------------------------------------
-  // Build optimised output tree
-  // -------------------------------------------------------------------------
+  // ---------------------------- Output build --------------------------------
 
   MapOfSets<std::string, std::string> result;
 
@@ -761,11 +672,8 @@ int main(int argc, char **argv) {
 
   std::vector<Conflict> conflicts;
 
-  // --- SAT entries (inserted first so UNSAT can overwrite on conflict) ------
-
-  // Track seen SAT key_sets for deduplication reporting.
+  // SAT entries first so UNSAT can overwrite on conflict.
   std::set<std::set<std::string>> satSeen;
-  // Map key_set → source so we can report the SAT side of any conflict.
   std::map<std::set<std::string>, std::string> satKeyToSource;
 
   for (const auto &e : satEntries) {
@@ -777,12 +685,8 @@ int main(int argc, char **argv) {
     result.insert(e.key_set, e.value);
   }
 
-  // --- UNSAT entries ---------------------------------------------------------
-
-  // Sort ascending by key_set size so that smaller (dominating) sets are
-  // processed before larger (dominated) sets.  Lexicographic tiebreak on
-  // the key_set itself makes the iteration order — and therefore the output
-  // file's byte content — deterministic across runs (std::sort is unstable).
+  // Ascending size order is required for dominance pruning; lex tiebreak
+  // makes the iteration order deterministic (std::sort is unstable).
   std::sort(unsatEntries.begin(), unsatEntries.end(),
             [](const Entry &a, const Entry &b) {
               if (a.key_set.size() != b.key_set.size())
@@ -790,23 +694,20 @@ int main(int argc, char **argv) {
               return a.key_set < b.key_set;
             });
 
-  // Separate incremental trie used only for subset queries during pruning.
-  // We do not re-use `result` for this because `result` contains SAT entries
-  // whose key_sets must not affect UNSAT dominance decisions.
+  // Separate trie used only for subset queries during pruning; `result` mixes
+  // SAT and UNSAT entries and must not influence dominance.
   MapOfSets<std::string, std::string> unsatTrie;
 
   std::set<std::set<std::string>> unsatSeen;
 
   for (const auto &e : unsatEntries) {
-    // Deduplication check (exact key_set seen before).
     if (dedup && !unsatSeen.insert(e.key_set).second) {
       ++unsatDuplicates;
       continue;
     }
 
     if (pruneUnsat) {
-      // At this point e.key_set is not yet in unsatTrie (we only insert on
-      // acceptance), so any result from subsets() is a strict subset.
+      // e.key_set is not yet in unsatTrie, so a hit is a strict subset.
       std::vector<std::pair<std::set<std::string>, std::string>> subs;
       unsatTrie.subsets(e.key_set, subs);
       if (!subs.empty()) {
@@ -816,7 +717,6 @@ int main(int argc, char **argv) {
       unsatTrie.insert(e.key_set, e.value);
     }
 
-    // Check for a conflicting SAT entry at the same key_set.
     if (result.lookup(e.key_set) != nullptr) {
       ++satConflicts;
       auto it = satKeyToSource.find(e.key_set);
@@ -825,18 +725,13 @@ int main(int argc, char **argv) {
       conflicts.push_back({e.key_set, satSrc, e.source});
     }
 
-    // Insert UNSAT into result, overwriting any conflicting SAT value.
+    // UNSAT overwrites any conflicting SAT.
     result.insert(e.key_set, e.value);
   }
-
-  // -------------------------------------------------------------------------
-  // Statistics
-  // -------------------------------------------------------------------------
 
   const size_t unsatOut = unsatIn - unsatDuplicates - unsatDominated;
   const size_t satOut   = satIn   - satDuplicates   - satConflicts;
   const size_t totalOut = unsatOut + satOut;
-  // (totalRemoved is computed inline in the print block; underflow-safe there)
 
   if (!storedSolver.empty())
     fprintf(stdout, "Solver       : %s\n", storedSolver.c_str());
@@ -877,10 +772,6 @@ int main(int argc, char **argv) {
               totalOut - inputTotal);
   }
 
-  // -------------------------------------------------------------------------
-  // Report SAT/UNSAT inconsistencies
-  // -------------------------------------------------------------------------
-
   if (!conflicts.empty()) {
     for (const auto &c : conflicts) {
       fprintf(stderr,
@@ -894,10 +785,6 @@ int main(int argc, char **argv) {
             "UNSAT entries were kept\n",
             conflicts.size(), conflicts.size() == 1 ? "y" : "ies");
   }
-
-  // -------------------------------------------------------------------------
-  // Verification pass: roundtrip every entry through parser + solver
-  // -------------------------------------------------------------------------
 
   if (verify) {
     fprintf(stdout, "\nVerifying entries against solver (timeout=%us)...\n",
@@ -947,10 +834,6 @@ int main(int argc, char **argv) {
     fprintf(stdout, "\n(--stats: no output written)\n");
     return conflicts.empty() ? 0 : 2;
   }
-
-  // -------------------------------------------------------------------------
-  // Write output
-  // -------------------------------------------------------------------------
 
   CacheMetadata meta;
   meta.solverBackend = storedSolver;

@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
-// On-disk multi-byte integers are read with raw memcpy.  Until that goes
-// through explicit LE helpers, the format is little-endian only.
+// Multi-byte integers are read via raw memcpy; LE-only until routed through
+// explicit byte-order helpers.
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "MapOfSets file format requires a little-endian host");
@@ -26,7 +26,6 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
       close(fd_);
       fd_ = -1;
     }
-    // valid_ stays false
   };
 
   fd_ = open(filename.c_str(), O_RDONLY);
@@ -40,15 +39,11 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   mmap_base_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0);
   if (mmap_base_ == MAP_FAILED) { fail("DiskMapOfSets: mmap failed"); return; }
 
-  // POSIX mmap semantics: once the mapping exists, the kernel keeps the
-  // underlying inode alive even if the fd is closed.  Close the fd now so
-  // we don't tie up a descriptor for the lifetime of this object — KLEE
-  // already manages many open files (test cases, log files, output files).
+  // Mapping keeps the inode alive after close.
   close(fd_);
   fd_ = -1;
 
-  // On-disk layout (v2):
-  //   [u64 magic][u64 header_size][Header proto][directory][values][string table][chunks]
+  // Layout: [u64 magic][u64 header_size][Header proto][directory][values][string table][chunks]
   static constexpr uint64_t kRawMagic = 0x4d41504f53455453ULL; // "MAPOSETS"
 
   if (file_size_ < 16) { fail("DiskMapOfSets: file too small (<16 bytes)"); return; }
@@ -74,18 +69,13 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     return;
   }
 
-  // chunk_id / local_id divide by chunk_size; a corrupt header with 0 here
-  // would SIGFPE on the first lookup.  The writer never produces 0 (default
-  // 1024) so this only catches malformed/adversarial files.
+  // chunk_size==0 would SIGFPE in chunk_id arithmetic.
   if (header_file_.header().chunk_size() == 0) {
     fail("DiskMapOfSets: chunk_size is zero in"); return;
   }
 
-  // Canonicalization version check: keys are produced by
-  // buildConstraintDiskKey; if the algorithm changes the version is bumped so
-  // that stale files are rejected rather than silently producing all misses.
-  // Files written before this field was added have version 0 (proto3 default)
-  // and must be rebuilt.
+  // Stale-key files (older canonicalization) must be rebuilt rather than
+  // silently producing all misses.
   static constexpr uint32_t kExpectedCanonVersion = 1;
   uint32_t canon_version = header_file_.header().canonicalization_version();
   if (canon_version != kExpectedCanonVersion) {
@@ -93,14 +83,12 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     return;
   }
 
-  // Validate directory region.
   uint64_t dir_off = header_file_.header().directory_offset();
   uint64_t dir_sz  = header_file_.header().directory_size();
   if (dir_off < 16ULL + header_size || dir_off + dir_sz > (uint64_t)file_size_) {
     fail("DiskMapOfSets: directory range invalid in"); return;
   }
 
-  // Validate values region.
   uint64_t val_off = header_file_.header().values_offset();
   uint64_t val_sz  = header_file_.header().values_size();
   if (val_sz > 0 &&
@@ -108,7 +96,6 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
     fail("DiskMapOfSets: values region invalid in"); return;
   }
 
-  // Validate and load string table.
   uint64_t str_off = header_file_.header().string_table_offset();
   uint64_t str_sz  = header_file_.header().string_table_size();
   if (str_sz < 4 ||
@@ -157,9 +144,7 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
   uint64_t dir_off = header_file_.header().directory_offset();
   uint64_t chunk_entry_off = dir_off + (uint64_t)chunk_id * 12ULL;
 
-  // All bad-file paths below mark the cache invalid and return nullptr.
-  // Callers (get_node) translate that into a default Node so trie traversals
-  // degrade to "miss" rather than crashing the KLEE process.
+  // Bad-file paths below soft-fail to nullptr; get_node degrades to a "miss".
   if (chunk_entry_off + 12ULL > (uint64_t)file_size_) {
     klee_warning("DiskMapOfSets: chunk directory entry out of range "
                  "(chunk_id=%u); marking cache invalid", chunk_id);
@@ -202,9 +187,7 @@ NodeChunk *DiskMapOfSets::get_chunk(uint32_t chunk_id) {
 }
 
 const Node &DiskMapOfSets::get_node(uint32_t node_id) {
-  // Static empty Node: default-initialised has is_end_of_set=false and no
-  // children, which is exactly what we want for graceful degradation when
-  // the file is corrupt — callers see a "miss" and stop recursing.
+  // Default-initialised: not end-of-set, no children — degrades to "miss".
   static const Node kEmptyNode;
   uint32_t cid = chunk_id(node_id);
   uint32_t lid = local_id(node_id);
@@ -233,11 +216,8 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   uint64_t val_off = header_file_.header().values_offset();
   uint64_t val_sz  = header_file_.header().values_size();
 
-  // Bounds invariant established by the constructor:
-  //   val_off + val_sz <= file_size_
-  // The strict `>` comparisons are correct: `real + 4 == val_sz` means the
-  // length field exactly fills the values region (still within the mmap),
-  // which is a valid edge case.  Do NOT change to `>=`.
+  // `real + 4 == val_sz` is a valid edge case (length field exactly fills the
+  // region); do NOT change `>` to `>=`.
   if (real + 4ULL > val_sz) return "";
   const char *blob = static_cast<const char *>(mmap_base_) + val_off + real;
   uint32_t len = 0;
@@ -245,10 +225,6 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   if (real + 4ULL + (uint64_t)len > val_sz) return "";
   return std::string(blob + 4, len);
 }
-
-// ---------------------------------------------------------------------------
-// Public query interface
-// ---------------------------------------------------------------------------
 
 std::optional<std::string>
 DiskMapOfSets::lookup(const std::set<std::string> &query_set) {
@@ -334,14 +310,12 @@ void DiskMapOfSets::find_supersets(
   const auto &node = get_node(node_id);
 
   if (q_begin == q_end) {
-    // All query elements matched: any path to an end-of-set node is a superset.
     if (node.is_end_of_set())
       results.push_back(read_value(node.value_offset()));
 
     for (const auto &child : node.children())
       find_supersets(child.child_id(), q_begin, q_end, results);
   } else {
-    // Still have query elements to match.  Children and query are both sorted.
     const std::string &elt = *q_begin;
     auto next_q = std::next(q_begin);
 
@@ -349,14 +323,12 @@ void DiskMapOfSets::find_supersets(
       const std::string &child_key = key_str(child.key_index());
 
       if (child_key == elt) {
-        // This edge matches the current query element; advance the query.
         find_supersets(child.child_id(), next_q, q_end, results);
       } else if (child_key < elt) {
-        // Extra superset element before elt: follow without advancing the query.
+        // Extra superset element; follow without advancing the query.
         find_supersets(child.child_id(), q_begin, q_end, results);
       } else {
-        // child_key > elt: elt can never be matched by remaining children.
-        break;
+        break; // child_key > elt: remaining sorted children all overshoot.
       }
     }
   }
@@ -368,10 +340,8 @@ void DiskMapOfSets::enumerate_all(
     std::vector<bool> &visited,
     const std::function<void(const std::set<std::string>&,
                              const std::string&)> &cb) {
-  // Guard against malformed files with circular child_id references.  The
-  // bounded query traversals (lookup_rec, find_subsets, find_supersets) all
-  // shrink the query by one element per recursion so they self-terminate;
-  // forEach has no such bound, so we track visited nodes explicitly.
+  // Cycle guard for malformed files: query traversals self-terminate by
+  // shrinking the query, but forEach has no such bound.
   if (node_id < visited.size()) {
     if (visited[node_id]) {
       klee_warning("DiskMapOfSets: cycle detected at node %u during forEach; "
@@ -397,8 +367,6 @@ void DiskMapOfSets::forEach(
     std::function<void(const std::set<std::string>&, const std::string&)> cb) {
   if (!valid_) return;
   std::set<std::string> accum;
-  // Bitmap sized by total_nodes; a corrupt file with child_id >= total_nodes
-  // simply skips the visited check (the access is bounds-protected).
   std::vector<bool> visited(header_file_.header().total_nodes(), false);
   enumerate_all(header_file_.header().root_id(), accum, visited, cb);
 }

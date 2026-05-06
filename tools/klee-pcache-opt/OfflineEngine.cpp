@@ -19,9 +19,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 
-// Z3Builder lives under lib/Solver/ — we add that to the include path
-// (see CMakeLists.txt) and pull the header directly so we can drive a
-// parallel Z3 context for unsat-core extraction.
+// Direct Z3Builder access (via lib/Solver/ on the include path) lets us
+// drive a parallel Z3 context for unsat-core extraction.
 #include "Z3Builder.h"
 
 #include <cctype>
@@ -37,14 +36,8 @@ using namespace klee::expr;
 
 namespace klee_pcache_opt {
 
-// Synthetic array size used when reconstructing canonical-key arrays.  The
-// concrete size is irrelevant for symbolic-array satisfiability — Z3 models
-// arrays without a size constraint — but the parser requires a literal here.
+// Z3 models arrays without a size; the parser still requires a literal.
 static constexpr unsigned kSyntheticArraySize = 4096;
-
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
 
 OfflineEngine::OfflineEngine(unsigned coreSolverTimeoutSeconds)
     : builder_(createDefaultExprBuilder()),
@@ -61,10 +54,6 @@ OfflineEngine::OfflineEngine(unsigned coreSolverTimeoutSeconds)
 
 OfflineEngine::~OfflineEngine() = default;
 
-// ---------------------------------------------------------------------------
-// Unsat-core extraction (parallel Z3 context)
-// ---------------------------------------------------------------------------
-
 OfflineEngine::UnsatCoreResult
 OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   UnsatCoreResult res;
@@ -80,7 +69,6 @@ OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   Z3_solver solver = Z3_mk_solver(ctx);
   Z3_solver_inc_ref(ctx, solver);
 
-  // Configure: enable core production + per-call timeout.
   Z3_params params = Z3_mk_params(ctx);
   Z3_params_inc_ref(ctx, params);
   Z3_params_set_bool(ctx, params,
@@ -92,8 +80,8 @@ OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   Z3_solver_set_params(ctx, solver, params);
   Z3_params_dec_ref(ctx, params);
 
-  // Track each constraint with a fresh boolean literal so the unsat core
-  // call can identify which constraints participated.
+  // Track each constraint by a fresh literal so the unsat core identifies
+  // which inputs participated.
   Z3_sort boolSort = Z3_mk_bool_sort(ctx);
   std::vector<Z3_ast> trackers;
   trackers.reserve(constraints.size());
@@ -118,16 +106,14 @@ OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   };
 
   if (sat == Z3_L_UNDEF) {
-    // Either timeout or other unknown reason — we can't tell apart cheaply
-    // here; treat as timeout for the caller's purposes (the existing
-    // delta-debug fallback will simply not shrink).
+    // Treat unknown as timeout; delta-debug fallback will simply not shrink.
     res.timedOut = true;
     cleanup();
     return res;
   }
   if (sat == Z3_L_TRUE) {
     cleanup();
-    return res; // ok=false, coreIndices empty
+    return res;
   }
 
   Z3_ast_vector core = Z3_solver_get_unsat_core(ctx, solver);
@@ -148,13 +134,8 @@ OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   return res;
 }
 
-// ---------------------------------------------------------------------------
-// Canonical-key parsing
-// ---------------------------------------------------------------------------
-
-// Scan a constraint string for canonical array-name references (A0, A1, ...).
-// The canonicalizer only ever uses the form A<digits>, so a hand-rolled scan
-// over identifier-character runs is sufficient and cheap.
+// Hand-rolled scan for A<digits> identifiers; the canonicalizer never emits
+// any other shape so this is sufficient.
 void OfflineEngine::collectArrayNames(const std::string &s,
                                       std::set<std::string> &out) {
   size_t i = 0, n = s.size();
@@ -190,18 +171,15 @@ ParsedKey OfflineEngine::parseKey(
     return result;
   }
 
-  // Build a lookup from canonical name_index → byte vector for concrete arrays.
   std::map<uint8_t, const std::vector<unsigned char> *> concreteMap;
   for (const auto &p : concreteArrays)
     concreteMap[p.first] = &p.second;
 
-  // 1. Discover all array names referenced anywhere in the key.
   std::set<std::string> namesSet;
   for (const auto &s : key)
     collectArrayNames(s, namesSet);
 
-  // Sort by canonical index (A0 < A1 < ... < A10) so that the array order in
-  // the result matches the canonicalisation order.
+  // Numeric sort by canonical index (so A2 < A10) matches canonicalisation order.
   std::vector<std::string> names(namesSet.begin(), namesSet.end());
   std::sort(names.begin(), names.end(),
             [](const std::string &a, const std::string &b) {
@@ -210,9 +188,8 @@ ParsedKey OfflineEngine::parseKey(
               return ai < bi;
             });
 
-  // 2. Synthesise a KQuery source: array decls + (query [...] false).
-  // Arrays present in concreteMap are declared with their concrete byte values;
-  // all others are declared symbolic with a fixed synthetic size.
+  // Synthesise a KQuery: declare each array (concrete bytes if available,
+  // else symbolic), then a (query [...] false).
   std::ostringstream src;
   for (const auto &name : names) {
     unsigned nameIdx =
@@ -262,7 +239,6 @@ ParsedKey OfflineEngine::parseKey(
     return result;
   }
 
-  // 3. Walk decls to recover arrays (in declaration order) and the query.
   for (const auto &d : decls) {
     if (auto *AD = llvm::dyn_cast<ArrayDecl>(d.get())) {
       result.arrays.push_back(AD->Root);
@@ -271,26 +247,19 @@ ParsedKey OfflineEngine::parseKey(
     }
   }
 
-  // The Arrays in `result.arrays` and the ReadExprs inside `result.constraints`
-  // hold raw pointers into P's ArrayCache.  Keep both alive on the result.
+  // result.arrays and the ReadExprs in result.constraints alias P's
+  // ArrayCache; keep P alive for the lifetime of the result.
   result._decls = std::move(decls);
   result._parser = std::move(P);
   result.ok = true;
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// Solver wrappers
-// ---------------------------------------------------------------------------
-
 bool OfflineEngine::isUnsat(const std::vector<ref<Expr>> &constraints,
                             bool &timedOut) {
   timedOut = false;
-  // Solver::mustBeTrue / mayBeTrue short-circuit when the query expression is
-  // a constant (e.g., `false`), so we cannot use them to test "is this
-  // constraint set UNSAT?".  Drop into the impl directly: an empty objects
-  // vector makes computeInitialValues report SAT/UNSAT without serialising
-  // any model.
+  // mustBeTrue / mayBeTrue short-circuit on a constant query expression, so
+  // drop into impl directly with an empty objects vector.
   ConstraintSet cs(constraints);
   Query q(cs, ConstantExpr::alloc(0, Expr::Bool));
   std::vector<std::vector<unsigned char>> dummy;
@@ -317,10 +286,9 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
   if (n <= 1)
     return res;
 
-  // Step 1: ask Z3 directly for an unsat core (single solver call).  This
-  // both checks the UNSAT precondition and, on success, shrinks the index
-  // set to typically a small subset.  Z3's core is not guaranteed minimal,
-  // so step 2 polishes it via delta-debugging.
+  // Z3's unsat-core check shrinks N constraints to a typically small subset
+  // in one call (and serves as the UNSAT precondition check); delta-debug
+  // afterwards because the core is not guaranteed minimal.
   ++res.solverCalls;
   UnsatCoreResult core = getUnsatCore(constraints);
   if (core.timedOut) {
@@ -328,9 +296,8 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
     return res;
   }
   if (!core.ok) {
-    // SAT under symbolic-array reconstruction → canonical key relied on
-    // concrete-array contents we cannot reconstruct; shrinking would be
-    // unsound.  Caller should skip this entry.
+    // SAT under symbolic-array reconstruction: the canonical key depends on
+    // concrete bytes we can't recover, so shrinking would be unsound.
     res.notUnsatPrecondition = true;
     return res;
   }
@@ -338,14 +305,11 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
   if (res.keptIndices.size() <= 1)
     return res;
 
-  // Step 2: delta-debug the (typically small) core to true minimality.
-  // Try removing one constraint at a time; if the residue is still UNSAT,
-  // accept the removal and re-scan from that slot.  Otherwise advance.
   std::vector<ref<Expr>> sub;
   sub.reserve(n);
   size_t i = 0;
   while (i < res.keptIndices.size()) {
-    if (res.keptIndices.size() == 1) break; // can't shrink past 1
+    if (res.keptIndices.size() == 1) break;
 
     sub.clear();
     for (size_t j = 0; j < res.keptIndices.size(); ++j)
@@ -357,15 +321,13 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
     bool subUnsat = isUnsat(sub, subTimedOut);
 
     if (subTimedOut) {
-      // Treat timeout as "cannot remove" and advance — minimisation may still
-      // make progress on other indices.
       res.timedOut = true;
       ++i;
       continue;
     }
     if (subUnsat) {
       res.keptIndices.erase(res.keptIndices.begin() + i);
-      // Re-examine the same index (which now points at the next constraint).
+      // Don't advance: i now points at the next surviving constraint.
     } else {
       ++i;
     }
@@ -373,18 +335,12 @@ OfflineEngine::minimizeUnsatCore(const std::vector<ref<Expr>> &constraints) {
   return res;
 }
 
-// ---------------------------------------------------------------------------
-// Byte-level dependency components (Pass 2)
-// ---------------------------------------------------------------------------
-
 namespace {
 
-// Per-constraint footprint: which arrays it touches, and at which bytes.
-// `symbolic` means a non-constant index — the constraint depends on every
-// byte of that array.
+// Per-constraint footprint: which arrays are touched, at which byte offsets.
+// `symbolicArrays` membership means a non-constant index, i.e. the constraint
+// depends on every byte of that array.
 struct ConstraintFootprint {
-  // arrayName -> set of constant byte offsets (empty if `symbolicArrays`
-  // contains the same name).
   std::map<std::string, std::set<std::uint32_t>> concreteOffsets;
   std::set<std::string> symbolicArrays;
 };
@@ -436,9 +392,7 @@ OfflineEngine::computeByteComponents(
 
   DSU dsu(n);
 
-  // Owners: for each (array, offset) pair and for each "any byte of array",
-  // remember the first constraint that touched it; subsequent touchers union
-  // with that owner.
+  // First-toucher owner per (array, offset) and per "any byte of array".
   std::unordered_map<std::string, std::unordered_map<std::uint32_t, int>>
       offsetOwner;
   std::unordered_map<std::string, int> wildcardOwner;
@@ -446,8 +400,7 @@ OfflineEngine::computeByteComponents(
   for (std::size_t i = 0; i < n; ++i) {
     const auto &fp = fps[i];
 
-    // Symbolic-index arrays: this constraint depends on every byte of each
-    // such array, so unite with every prior owner of that array.
+    // Symbolic-index reads depend on every byte: unite with all prior owners.
     for (const auto &name : fp.symbolicArrays) {
       auto wIt = wildcardOwner.find(name);
       if (wIt != wildcardOwner.end())
@@ -462,8 +415,6 @@ OfflineEngine::computeByteComponents(
       }
     }
 
-    // Concrete offsets: unite with prior owner of (array, offset), and with
-    // any wildcard owner of array.
     for (const auto &[name, offs] : fp.concreteOffsets) {
       auto wIt = wildcardOwner.find(name);
       if (wIt != wildcardOwner.end())
@@ -480,7 +431,6 @@ OfflineEngine::computeByteComponents(
     }
   }
 
-  // Group constraint indices by component root, accumulating array coverage.
   std::unordered_map<int, ByteComponent> byRoot;
   for (std::size_t i = 0; i < n; ++i) {
     int r = dsu.find(static_cast<int>(i));
@@ -507,7 +457,7 @@ OfflineEngine::computeByteComponents(
         for (auto o : offs) if (o + 1 > cur) cur = o + 1;
         it->second = cur;
       }
-      // else: already nullopt (symbolic) → leave as-is
+      // nullopt (symbolic) is preserved.
     }
   }
 
