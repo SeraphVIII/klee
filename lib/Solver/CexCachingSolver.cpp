@@ -96,6 +96,13 @@ cl::opt<unsigned> DiskCacheHitRateWindow(
     cl::init(200),
     cl::cat(SolvingCat));
 
+cl::opt<unsigned> DiskCexCacheLruSize(
+    "disk-cex-cache-lru-size",
+    cl::desc("Bound on decoded chunks held in memory while reading the "
+             "disk CEX cache (default = 100)"),
+    cl::init(100),
+    cl::cat(SolvingCat));
+
 cl::opt<bool> DebugCexCacheCheckBinding(
     "debug-cex-cache-check-binding", cl::init(false),
     cl::desc("Debug the correctness of the counterexample "
@@ -422,7 +429,8 @@ CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
     logPath = PersistentCexCacheFile.getValue() + ".log";
 
   if (!readPath.empty())
-    diskCexCache_ = std::make_unique<DiskCexCache>(readPath, buildCacheMetadata());
+    diskCexCache_ = std::make_unique<DiskCexCache>(
+        readPath, buildCacheMetadata(), DiskCexCacheLruSize.getValue());
 
   if (!logPath.empty()) {
     logFd_ = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);

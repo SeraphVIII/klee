@@ -28,8 +28,10 @@ public:
 
   /// `current` describes the running KLEE; metadata mismatch is non-fatal
   /// (warns only — SAT is re-verified, UNSAT is solver-agnostic).
+  /// `lruCacheSize` bounds the number of decoded chunks held in memory.
   explicit DiskCexCache(const std::string &filename,
-                        const CacheMetadata &current = {});
+                        const CacheMetadata &current = {},
+                        size_t lruCacheSize = 100);
 
   /// Look up a cached result, checking supersets first (when trySuperset)
   /// then subsets.  outAssignment is non-null for SAT, null for UNSAT.

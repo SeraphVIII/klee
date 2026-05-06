@@ -10,8 +10,9 @@ using namespace klee;
 using mapofsets::DiskMapOfSets;
 
 DiskCexCache::DiskCexCache(const std::string &filename,
-                           const CacheMetadata &current)
-    : disk_(filename), builder_(createDefaultExprBuilder()) {
+                           const CacheMetadata &current,
+                           size_t lruCacheSize)
+    : disk_(filename, lruCacheSize), builder_(createDefaultExprBuilder()) {
   if (!disk_.isValid())
     return;
 

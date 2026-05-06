@@ -220,6 +220,9 @@ static void printUsage(const char *prog) {
       "  --verify               Roundtrip every entry through the solver to\n"
       "                         confirm parse + UNSAT/SAT classification (slow)\n"
       "  --solver-timeout SECS  Per-query solver timeout (default 30, 0 = none)\n"
+      "  --chunk-size N         Nodes per chunk in the output cache (default 1024)\n"
+      "  --lru-cache-size N     LRU bound on chunks held in memory while reading\n"
+      "                         the input cache (default 200)\n"
       "  -h, --help             Show this help\n",
       prog);
 }
@@ -246,6 +249,8 @@ int main(int argc, char **argv) {
   bool discoverUnsatPairs = false;
   size_t maxPairCalls = 10000;
   unsigned solverTimeoutSec = 30;
+  uint32_t chunkSize = 1024;
+  size_t lruCacheSize = 200;
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -272,6 +277,16 @@ int main(int argc, char **argv) {
       maxPairCalls = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
     } else if (strcmp(argv[i], "--solver-timeout") == 0 && i + 1 < argc) {
       solverTimeoutSec = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
+      chunkSize = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      if (chunkSize == 0) {
+        fprintf(stderr, "--chunk-size must be > 0\n"); return 1;
+      }
+    } else if (strcmp(argv[i], "--lru-cache-size") == 0 && i + 1 < argc) {
+      lruCacheSize = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+      if (lruCacheSize == 0) {
+        fprintf(stderr, "--lru-cache-size must be > 0\n"); return 1;
+      }
     } else if (strcmp(argv[i], "-h") == 0 ||
                strcmp(argv[i], "--help") == 0) {
       printUsage(argv[0]);
@@ -316,7 +331,7 @@ int main(int argc, char **argv) {
   std::string storedSolver, storedVersion;
 
   if (!inputPath.empty()) {
-    DiskMapOfSets disk(inputPath, /*max_cache_size=*/200);
+    DiskMapOfSets disk(inputPath, lruCacheSize);
     if (!disk.isValid()) {
       fprintf(stderr, "error: could not open or parse cache file: %s\n",
               inputPath.c_str());
@@ -839,7 +854,7 @@ int main(int argc, char **argv) {
   meta.solverBackend = storedSolver;
   meta.kleeVersion   = storedVersion;
 
-  MapOfSetsDiskBuilder::build(result, outputPath, meta);
+  MapOfSetsDiskBuilder::build(result, outputPath, meta, chunkSize);
 
   fprintf(stdout, "\nWritten to   : %s\n", outputPath.c_str());
   return conflicts.empty() ? 0 : 2;
