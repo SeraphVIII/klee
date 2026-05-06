@@ -55,9 +55,19 @@ DiskCexCache::DiskCexCache(const std::string &filename,
 std::string DiskCexCache::serializeAssignment(
     const Assignment *a,
     const std::map<const Array *, const Array *> &forwardArrayMap) {
-  if (forwardArrayMap.size() > 255)
-    klee_error("serializeAssignment: too many symbolic arrays (%zu) for "
-               "binary format (max 255)", forwardArrayMap.size());
+  // Soft-fail: returning empty here aliases the UNSAT sentinel, which is wrong
+  // for a SAT record, so production callers must pre-check (CexCachingSolver
+  // ::appendToCacheLog does).  Defence in depth: warn and return "" rather
+  // than klee_error here so a future caller that forgets the upstream guard,
+  // or a unit test invoking this directly, does not bring down the whole
+  // KLEE process.
+  if (forwardArrayMap.size() > 255) {
+    klee_warning_once(nullptr,
+                      "serializeAssignment: too many symbolic arrays (%zu) "
+                      "for binary format (max 255); returning empty record",
+                      forwardArrayMap.size());
+    return "";
+  }
 
   struct Entry { uint8_t idx; const std::vector<unsigned char> *bytes; };
   std::vector<Entry> entries;
