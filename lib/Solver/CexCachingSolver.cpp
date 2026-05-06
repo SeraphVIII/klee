@@ -281,10 +281,15 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
 
     const unsigned W = static_cast<unsigned>(diskCacheWindow_.size());
 
+    // Count this lookup once, regardless of whether it goes through to the
+    // disk cache or short-circuits in the suspension branch.  The previous
+    // shape incremented in both branches and double-counted the lookup that
+    // straddles the suspend→active transition.
+    ++diskCacheLookups_;
+
     // If suspended, skip disk lookup until we have accumulated W more misses
     // since suspension, then re-enable and give the cache another chance.
     if (diskCacheSuspendedAt_ != 0) {
-      ++diskCacheLookups_;
       if (diskCacheLookups_ - diskCacheSuspendedAt_ >= W) {
         diskCacheSuspendedAt_ = 0;
         diskCacheWindowPos_   = 0;
@@ -297,7 +302,6 @@ bool CexCachingSolver::searchForAssignment(KeyType &key, Assignment *&result) {
     }
 
     Assignment *diskResult = nullptr;
-    ++diskCacheLookups_;
     const bool hit = diskCexCache_->find(key, CexCacheSuperSet, diskResult);
 
     if (hit) {
