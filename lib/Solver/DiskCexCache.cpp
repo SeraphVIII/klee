@@ -107,24 +107,18 @@ DiskCexCache::parseAssignmentData(
     std::string name = "A" + std::to_string(name_index);
     auto nameIt = nameToOrig.find(name);
     if (nameIt != nameToOrig.end()) {
-      // Canonical-key construction alpha-renames arrays by name only; an
-      // 8-byte and a 9-byte query buffer can canonicalise to the same key.
-      // For SAT witnesses that is unsound — Assignment maps array→bytes and
-      // KLEE's IndependentSolver later asserts that all factors agree on
-      // array size.  Refuse the match if the cached witness size does not
-      // match the original array's size; the cache will report a miss and
-      // KLEE will fall back to the solver.  UNSAT entries (handled in
-      // pickEntry's Unsat branch) remain valid by monotonicity over an
-      // extended array, so this check is SAT-only.
+      // The canonical key doesn't encode array size, so the cached witness
+      // may not match the live array's size. Resize it (zero-pad/truncate)
+      // rather than reject: pickEntry's satisfies() re-verifies, and an
+      // exact-sized witness is required or IndependentSolver asserts.
       const Array *orig = nameIt->second;
-      if (orig->size != data_len) {
-        pos += data_len;
-        return nullptr;
-      }
+      const unsigned char *src =
+          reinterpret_cast<const unsigned char *>(&data[pos]);
+      std::vector<unsigned char> witness(orig->size, 0);
+      std::memcpy(witness.data(), src,
+                  std::min<size_t>(data_len, orig->size));
       objects.push_back(orig);
-      values.emplace_back(
-          reinterpret_cast<const unsigned char *>(&data[pos]),
-          reinterpret_cast<const unsigned char *>(&data[pos]) + data_len);
+      values.push_back(std::move(witness));
     }
     pos += data_len;
   }
