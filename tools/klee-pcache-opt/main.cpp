@@ -21,6 +21,7 @@
 #include "klee/ADT/MapOfSets.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -127,13 +128,28 @@ static size_t readLogFile(const std::string &path,
   }
 
   std::vector<char> buf(st.st_size);
-  ssize_t n = read(fd, buf.data(), buf.size());
+  // read() may return a short count on large files or signal interruption;
+  // loop until the file is drained so trailing records are not lost.
+  size_t total = 0;
+  while (total < buf.size()) {
+    ssize_t n = read(fd, buf.data() + total, buf.size() - total);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      fprintf(stderr, "error: read failed on log file: %s\n", path.c_str());
+      close(fd);
+      return 0;
+    }
+    if (n == 0)
+      break; // unexpected early EOF; parse whatever was read
+    total += static_cast<size_t>(n);
+  }
   close(fd);
-  if (n <= 0)
+  if (total == 0)
     return 0;
 
   size_t pos = 0;
-  size_t fileSize = static_cast<size_t>(n);
+  size_t fileSize = total;
   size_t count = 0;
 
   while (pos + 4 <= fileSize) {
@@ -226,10 +242,6 @@ static void printUsage(const char *prog) {
       "  -h, --help             Show this help\n",
       prog);
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Main

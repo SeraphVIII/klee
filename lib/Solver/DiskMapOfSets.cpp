@@ -202,6 +202,17 @@ const Node &DiskMapOfSets::get_node(uint32_t node_id) {
   return chunk->nodes(lid);
 }
 
+DiskMapOfSets::NodeView DiskMapOfSets::get_node_view(uint32_t node_id) {
+  const Node &node = get_node(node_id);
+  NodeView view;
+  view.is_end_of_set = node.is_end_of_set();
+  view.value_offset = node.value_offset();
+  view.children.reserve(node.children().size());
+  for (const auto &c : node.children())
+    view.children.push_back({c.key_index(), c.child_id()});
+  return view;
+}
+
 const std::string &DiskMapOfSets::key_str(uint32_t index) const {
   if (index >= string_table_.size()) {
     klee_error("DiskMapOfSets: key_index %u out of range (table size %zu)",
@@ -216,6 +227,8 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   uint64_t val_off = header_file_.header().values_offset();
   uint64_t val_sz  = header_file_.header().values_size();
 
+  // Reject a wild offset up front so the arithmetic below cannot wrap uint64.
+  if (real >= val_sz) return "";
   // `real + 4 == val_sz` is a valid edge case (length field exactly fills the
   // region); do NOT change `>` to `>=`.
   if (real + 4ULL > val_sz) return "";
@@ -272,23 +285,24 @@ void DiskMapOfSets::find_subsets(
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
     std::vector<std::string> &results) {
-  const auto &node = get_node(node_id);
+  // Snapshot before recursing: a recursive call can evict this node's chunk.
+  NodeView node = get_node_view(node_id);
 
-  if (node.is_end_of_set())
-    results.push_back(read_value(node.value_offset()));
+  if (node.is_end_of_set)
+    results.push_back(read_value(node.value_offset));
 
   for (auto q_it = q_begin; q_it != q_end; ++q_it) {
     const std::string &elt = *q_it;
 
     auto child_it = std::lower_bound(
-        node.children().begin(), node.children().end(), elt,
-        [this](const Child &c, const std::string &t) {
-          return key_str(c.key_index()) < t;
+        node.children.begin(), node.children.end(), elt,
+        [this](const ChildRef &c, const std::string &t) {
+          return key_str(c.key_index) < t;
         });
 
-    if (child_it != node.children().end() &&
-        key_str(child_it->key_index()) == elt) {
-      find_subsets(child_it->child_id(), std::next(q_it), q_end, results);
+    if (child_it != node.children.end() &&
+        key_str(child_it->key_index) == elt) {
+      find_subsets(child_it->child_id, std::next(q_it), q_end, results);
     }
   }
 }
@@ -307,26 +321,27 @@ void DiskMapOfSets::find_supersets(
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
     std::vector<std::string> &results) {
-  const auto &node = get_node(node_id);
+  // Snapshot before recursing: a recursive call can evict this node's chunk.
+  NodeView node = get_node_view(node_id);
 
   if (q_begin == q_end) {
-    if (node.is_end_of_set())
-      results.push_back(read_value(node.value_offset()));
+    if (node.is_end_of_set)
+      results.push_back(read_value(node.value_offset));
 
-    for (const auto &child : node.children())
-      find_supersets(child.child_id(), q_begin, q_end, results);
+    for (const auto &child : node.children)
+      find_supersets(child.child_id, q_begin, q_end, results);
   } else {
     const std::string &elt = *q_begin;
     auto next_q = std::next(q_begin);
 
-    for (const auto &child : node.children()) {
-      const std::string &child_key = key_str(child.key_index());
+    for (const auto &child : node.children) {
+      const std::string &child_key = key_str(child.key_index);
 
       if (child_key == elt) {
-        find_supersets(child.child_id(), next_q, q_end, results);
+        find_supersets(child.child_id, next_q, q_end, results);
       } else if (child_key < elt) {
         // Extra superset element; follow without advancing the query.
-        find_supersets(child.child_id(), q_begin, q_end, results);
+        find_supersets(child.child_id, q_begin, q_end, results);
       } else {
         break; // child_key > elt: remaining sorted children all overshoot.
       }
@@ -351,14 +366,15 @@ void DiskMapOfSets::enumerate_all(
     }
     visited[node_id] = true;
   }
-  const auto &node = get_node(node_id);
-  if (node.is_end_of_set())
-    cb(accum, read_value(node.value_offset()));
+  // Snapshot before recursing: a recursive call can evict this node's chunk.
+  NodeView node = get_node_view(node_id);
+  if (node.is_end_of_set)
+    cb(accum, read_value(node.value_offset));
 
-  for (const auto &child : node.children()) {
-    const std::string &key = key_str(child.key_index());
+  for (const auto &child : node.children) {
+    const std::string &key = key_str(child.key_index);
     accum.insert(key);
-    enumerate_all(child.child_id(), accum, visited, cb);
+    enumerate_all(child.child_id, accum, visited, cb);
     accum.erase(key);
   }
 }

@@ -13,7 +13,6 @@
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Expr/ExprBuilder.h"
 #include "klee/Expr/ExprUtil.h"
 #include "klee/Expr/ExprVisitor.h"
 #include "klee/Support/OptionCategories.h"
@@ -92,8 +91,8 @@ cl::opt<unsigned> DiskCacheMinHitRatePct(
 cl::opt<unsigned> DiskCacheHitRateWindow(
     "disk-cex-cache-hit-rate-window",
     cl::desc("Sliding-window size (number of recent lookups) used by "
-             "--disk-cex-cache-min-hit-rate (default = 200)"),
-    cl::init(200),
+             "--disk-cex-cache-min-hit-rate (default = 100)."),
+    cl::init(100),
     cl::cat(SolvingCat));
 
 cl::opt<unsigned> DiskCexCacheLruSize(
@@ -157,7 +156,6 @@ class CexCachingSolver : public SolverImpl {
 
   int logFd_ = -1;
   ArrayCache logArrayCache_;
-  std::unique_ptr<ExprBuilder> logExprBuilder_;
 
   void appendToCacheLog(const KeyType &key, Assignment *a);
 
@@ -438,7 +436,6 @@ CexCachingSolver::CexCachingSolver(std::unique_ptr<Solver> solver)
       klee_warning("Cannot open CEX cache log '%s': %s",
                    logPath.c_str(), strerror(errno));
     } else {
-      logExprBuilder_.reset(createDefaultExprBuilder());
       klee_message("CEX cache log: %s", logPath.c_str());
     }
   }
@@ -462,7 +459,7 @@ CexCachingSolver::~CexCachingSolver() {
 void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   std::vector<ref<Expr>> vec(key.begin(), key.end());
   auto [diskKey, canon] =
-      buildConstraintDiskKey(vec, *logExprBuilder_, logArrayCache_);
+      buildConstraintDiskKey(vec, logArrayCache_);
 
   // serializeAssignment guards the SAT path; mirror the cap here so the
   // UNSAT (value="") path does not silently truncate uint8 indices past 255.

@@ -12,7 +12,6 @@
 #include "klee/Expr/ArrayCache.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Expr/ExprBuilder.h"
 #include "klee/Expr/ExprPPrinter.h"
 #include "klee/Solver/ConstraintCanonicalizer.h"
 #include "klee/Solver/DiskCexCache.h"
@@ -458,11 +457,10 @@ TEST(DiskCexCacheTest, AssignmentRoundTrip) {
   std::set<ref<Expr>> constraintSet = {constraint};
 
   // --- Canonicalize to get the disk key and the array renaming map ---
-  std::unique_ptr<ExprBuilder> builder(createDefaultExprBuilder());
   ArrayCache canonAC; // separate cache so canonical arrays live long enough
   std::vector<ref<Expr>> vec(constraintSet.begin(), constraintSet.end());
   CanonicalizationResult canon =
-      canonicalizeConstraintSet(vec, *builder, canonAC);
+      canonicalizeConstraintSet(vec, canonAC);
 
   // Serialize each canonical constraint to produce the disk key strings.
   std::set<std::string> diskKeySet;
@@ -573,14 +571,13 @@ TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
   // --- Replicate the writeCacheToDisk loop ---
   MapOfSetsDiskBuilder::UBTree diskTree;
   ArrayCache writeAC;
-  std::unique_ptr<ExprBuilder> writeBuilder(createDefaultExprBuilder());
 
   for (auto it = inMemCache.begin(); it != inMemCache.end(); ++it) {
     auto [keySet, assignment] = *it;
 
     std::vector<ref<Expr>> vec(keySet.begin(), keySet.end());
     CanonicalizationResult canon =
-        canonicalizeConstraintSet(vec, *writeBuilder, writeAC);
+        canonicalizeConstraintSet(vec, writeAC);
 
     std::set<std::string> diskKey;
     for (const auto &e : canon.constraints) {
@@ -659,11 +656,10 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
   {
     MapOfSetsDiskBuilder::UBTree tree;
     ArrayCache ac;
-    std::unique_ptr<ExprBuilder> b(createDefaultExprBuilder());
 
     auto addEntry = [&](const std::set<ref<Expr>> &constraints, Assignment *a) {
       std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-      CanonicalizationResult canon = canonicalizeConstraintSet(vec, *b, ac);
+      CanonicalizationResult canon = canonicalizeConstraintSet(vec, ac);
       std::set<std::string> diskKey;
       for (const auto &e : canon.constraints) {
         std::string s; llvm::raw_string_ostream os(s);
@@ -703,7 +699,6 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
   {
     MapOfSetsDiskBuilder::UBTree tree;
     ArrayCache ac;
-    std::unique_ptr<ExprBuilder> b(createDefaultExprBuilder());
 
     // Seed from gen1 (simulates the merge-on-write constructor logic)
     klee::mapofsets::DiskMapOfSets existing(gen1File);
@@ -714,7 +709,7 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
     // Add new gen2 entry
     {
       std::vector<ref<Expr>> vec = {constrZ};
-      CanonicalizationResult canon = canonicalizeConstraintSet(vec, *b, ac);
+      CanonicalizationResult canon = canonicalizeConstraintSet(vec, ac);
       std::set<std::string> diskKey;
       for (const auto &e : canon.constraints) {
         std::string s; llvm::raw_string_ostream os(s);

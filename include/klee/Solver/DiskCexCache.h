@@ -6,7 +6,6 @@
 #include "klee/Solver/MapOfSetsDiskBuilder.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Expr/ExprBuilder.h"
 #include "klee/Expr/ArrayCache.h"
 
 #include <map>
@@ -47,7 +46,6 @@ public:
 
 private:
   mapofsets::DiskMapOfSets disk_;
-  std::unique_ptr<ExprBuilder> builder_;
   mutable ArrayCache arrayCache_;
   // Owns reconstructed Assignments; raw pointers returned via outAssignment
   // alias entries here and stay valid for the lifetime of this object.

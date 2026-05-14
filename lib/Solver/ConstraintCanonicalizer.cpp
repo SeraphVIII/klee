@@ -29,7 +29,24 @@ bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
     const ReadExpr *rb = cast<ReadExpr>(b);
     int cmp = ra->updates.root->name.compare(rb->updates.root->name);
     if (cmp != 0) return cmp < 0;
-    return operator()(ra->index, rb->index);
+    if (operator()(ra->index, rb->index)) return true;
+    if (operator()(rb->index, ra->index)) return false;
+    // Indices equivalent — also order by the update list so this is a *total*
+    // order. A non-total comparator leaves std::sort's tie order input-
+    // dependent, which would make DFS array naming vary across runs.
+    ref<UpdateNode> ua = ra->updates.head;
+    ref<UpdateNode> ub = rb->updates.head;
+    while (ua && ub) {
+      if (operator()(ua->index, ub->index)) return true;
+      if (operator()(ub->index, ua->index)) return false;
+      if (operator()(ua->value, ub->value)) return true;
+      if (operator()(ub->value, ua->value)) return false;
+      ua = ua->next;
+      ub = ub->next;
+    }
+    if (ua) return false; // ra's update list is longer
+    if (ub) return true;  // rb's update list is longer
+    return false;         // fully equivalent
   }
 
   unsigned ak = a->getNumKids();
@@ -159,9 +176,13 @@ static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
     return ExtractExpr::create(kids[0], ee->offset, ee->width);
   }
   case Expr::Constant:
-  case Expr::Read:
-    // ReadExpr's update list is rewritten by ArraySubstitutionVisitor.
     return orig;
+  case Expr::Read: {
+    // Update list is already on canonical arrays (ArraySubstitutionVisitor);
+    // rebuild with the canonicalized index rather than dropping it.
+    const ReadExpr *re = cast<ReadExpr>(orig);
+    return ReadExpr::create(re->updates, kids[0]);
+  }
   default:
     llvm_unreachable("rebuildWithKids: unhandled expression kind");
   }
@@ -254,7 +275,6 @@ ref<Expr> canonicalizeExprTree(ref<Expr> e) {
 
 CanonicalizationResult
 canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
-                          ExprBuilder &builder,
                           ArrayCache &arrayCache) {
   CanonicalizationResult res;
   res.constraints = constraints;
@@ -306,10 +326,9 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
 
 std::pair<std::set<std::string>, CanonicalizationResult>
 buildConstraintDiskKey(const std::vector<ref<Expr>> &constraints,
-                       ExprBuilder &builder,
                        ArrayCache &arrayCache) {
   CanonicalizationResult canon =
-      canonicalizeConstraintSet(constraints, builder, arrayCache);
+      canonicalizeConstraintSet(constraints, arrayCache);
 
   std::set<std::string> key;
   for (const auto &e : canon.constraints) {

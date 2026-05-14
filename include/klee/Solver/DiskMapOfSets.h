@@ -67,6 +67,18 @@ private:
 
   NodeChunk* get_chunk(uint32_t chunk_id);
   const Node& get_node(uint32_t node_id);
+
+  // A node's data copied out of its (evictable) chunk. Traversals that recurse
+  // must snapshot via get_node_view first: a recursive get_node() can evict the
+  // chunk backing a still-live get_node() reference.
+  struct ChildRef { uint32_t key_index; uint32_t child_id; };
+  struct NodeView {
+    bool is_end_of_set = false;
+    uint64_t value_offset = 0;
+    std::vector<ChildRef> children; // sorted by key, same as on disk
+  };
+  NodeView get_node_view(uint32_t node_id);
+
   const std::string& key_str(uint32_t index) const;
   std::string read_value(uint64_t offset) const;
 
