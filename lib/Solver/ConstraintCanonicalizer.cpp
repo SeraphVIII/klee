@@ -8,56 +8,92 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <map>
 #include <unordered_map>
+#include <utility>
 
 using namespace klee;
 
-bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
-                                          const ref<Expr> &b) const {
-  if (a.get() == b.get()) return false;
-  if (a->getKind() != b->getKind()) return a->getKind() < b->getKind();
-  if (a->getWidth() != b->getWidth()) return a->getWidth() < b->getWidth();
+namespace {
 
-  if (a->getKind() == Expr::Constant) {
+// Three-way compare matching ExprCanonicalOrder's order, memoised on (a,b)
+// pairs: Expr operands are shared DAGs, so an unmemoised recursion is
+// exponential in the sharing factor. Returns <0 / 0 / >0.
+int compareExpr(const ref<Expr> &a, const ref<Expr> &b,
+                std::map<std::pair<const Expr *, const Expr *>, int> &memo) {
+  if (a.get() == b.get())
+    return 0;
+
+  std::pair<const Expr *, const Expr *> key(a.get(), b.get());
+  auto it = memo.find(key);
+  if (it != memo.end())
+    return it->second;
+
+  int result;
+  if (a->getKind() != b->getKind()) {
+    result = a->getKind() < b->getKind() ? -1 : 1;
+  } else if (a->getWidth() != b->getWidth()) {
+    result = a->getWidth() < b->getWidth() ? -1 : 1;
+  } else if (a->getKind() == Expr::Constant) {
     const ConstantExpr *ca = cast<ConstantExpr>(a);
     const ConstantExpr *cb = cast<ConstantExpr>(b);
-    return ca->getAPValue().ult(cb->getAPValue());
-  }
-
-  if (a->getKind() == Expr::Read) {
+    if (ca->getAPValue().ult(cb->getAPValue()))
+      result = -1;
+    else if (cb->getAPValue().ult(ca->getAPValue()))
+      result = 1;
+    else
+      result = 0;
+  } else if (a->getKind() == Expr::Read) {
     const ReadExpr *ra = cast<ReadExpr>(a);
     const ReadExpr *rb = cast<ReadExpr>(b);
     int cmp = ra->updates.root->name.compare(rb->updates.root->name);
-    if (cmp != 0) return cmp < 0;
-    if (operator()(ra->index, rb->index)) return true;
-    if (operator()(rb->index, ra->index)) return false;
-    // Indices equivalent — also order by the update list so this is a *total*
-    // order. A non-total comparator leaves std::sort's tie order input-
-    // dependent, which would make DFS array naming vary across runs.
-    ref<UpdateNode> ua = ra->updates.head;
-    ref<UpdateNode> ub = rb->updates.head;
-    while (ua && ub) {
-      if (operator()(ua->index, ub->index)) return true;
-      if (operator()(ub->index, ua->index)) return false;
-      if (operator()(ua->value, ub->value)) return true;
-      if (operator()(ub->value, ua->value)) return false;
-      ua = ua->next;
-      ub = ub->next;
+    if (cmp != 0) {
+      result = cmp < 0 ? -1 : 1;
+    } else {
+      result = compareExpr(ra->index, rb->index, memo);
+      if (result == 0) {
+        // Indices equivalent — also order by the update list so this is a
+        // *total* order. A non-total comparator leaves std::sort's tie order
+        // input-dependent, which would make DFS array naming vary across runs.
+        ref<UpdateNode> ua = ra->updates.head;
+        ref<UpdateNode> ub = rb->updates.head;
+        while (ua && ub && result == 0) {
+          result = compareExpr(ua->index, ub->index, memo);
+          if (result == 0)
+            result = compareExpr(ua->value, ub->value, memo);
+          ua = ua->next;
+          ub = ub->next;
+        }
+        if (result == 0) {
+          if (ua)
+            result = 1; // ra's update list is longer
+          else if (ub)
+            result = -1; // rb's update list is longer
+        }
+      }
     }
-    if (ua) return false; // ra's update list is longer
-    if (ub) return true;  // rb's update list is longer
-    return false;         // fully equivalent
+  } else {
+    unsigned ak = a->getNumKids();
+    unsigned bk = b->getNumKids();
+    if (ak != bk) {
+      result = ak < bk ? -1 : 1;
+    } else {
+      result = 0;
+      for (unsigned i = 0; i < ak && result == 0; ++i)
+        result = compareExpr(a->getKid(i), b->getKid(i), memo);
+    }
   }
 
-  unsigned ak = a->getNumKids();
-  unsigned bk = b->getNumKids();
-  if (ak != bk) return ak < bk;
+  memo.emplace(key, result);
+  return result;
+}
 
-  for (unsigned i = 0; i < ak; ++i) {
-    if (operator()(a->getKid(i), b->getKid(i))) return true;
-    if (operator()(b->getKid(i), a->getKid(i))) return false;
-  }
-  return false;
+} // namespace
+
+bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
+                                          const ref<Expr> &b) const {
+  std::map<std::pair<const Expr *, const Expr *>, int> memo;
+  return compareExpr(a, b, memo) < 0;
 }
 
 namespace {
@@ -252,9 +288,12 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   return elems[0];
 }
 
-namespace klee {
-
-ref<Expr> canonicalizeExprTree(ref<Expr> e) {
+// Memoised tree canonicalisation: same exponential-on-shared-DAGs problem as
+// compareExpr. Keying on the original Expr* is sound — canonicalisation is a
+// pure function of node structure.
+static ref<Expr>
+canonicalizeExprTreeMemo(const ref<Expr> &e,
+                         std::unordered_map<const Expr *, ref<Expr>> &memo) {
   if (e.isNull())
     return e;
 
@@ -262,17 +301,32 @@ ref<Expr> canonicalizeExprTree(ref<Expr> e) {
   if (n == 0)
     return e;
 
+  auto it = memo.find(e.get());
+  if (it != memo.end())
+    return it->second;
+
   std::vector<ref<Expr>> kids;
   kids.reserve(n);
   for (unsigned i = 0; i < n; ++i)
-    kids.push_back(canonicalizeExprTree(e->getKid(i)));
+    kids.push_back(canonicalizeExprTreeMemo(e->getKid(i), memo));
 
+  ref<Expr> result;
   if (isCommutativeKind(e->getKind())) {
     ref<Expr> tmp = rebuildWithKids(e, kids);
-    return flattenAndRebuildAssoc(tmp);
+    result = flattenAndRebuildAssoc(tmp);
+  } else {
+    result = rebuildWithKids(e, kids);
   }
 
-  return rebuildWithKids(e, kids);
+  memo.emplace(e.get(), result);
+  return result;
+}
+
+namespace klee {
+
+ref<Expr> canonicalizeExprTree(ref<Expr> e) {
+  std::unordered_map<const Expr *, ref<Expr>> memo;
+  return canonicalizeExprTreeMemo(e, memo);
 }
 
 CanonicalizationResult
@@ -317,8 +371,10 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
   for (auto &e : res.constraints)
     e = subst.visit(e);
 
+  // Shared memo: constraints share sub-DAGs after substitution.
+  std::unordered_map<const Expr *, ref<Expr>> treeMemo;
   for (auto &e : res.constraints)
-    e = canonicalizeExprTree(e);
+    e = canonicalizeExprTreeMemo(e, treeMemo);
 
   // Renaming and tree canonicalization can perturb the relative order; re-sort.
   std::sort(res.constraints.begin(), res.constraints.end(), cmp);
