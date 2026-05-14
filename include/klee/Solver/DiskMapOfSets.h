@@ -91,9 +91,13 @@ private:
                     std::set<std::string>::const_iterator q_end,
                     std::vector<std::string>& results);
 
+  // visited guards against circular child_id references in malformed files:
+  // the empty-query and "extra element" branches recurse without shrinking
+  // the query, so they cannot self-terminate on a cycle.
   void find_supersets(uint32_t node_id,
                       std::set<std::string>::const_iterator q_begin,
                       std::set<std::string>::const_iterator q_end,
+                      std::vector<bool>& visited,
                       std::vector<std::string>& results);
 
   // visited guards against circular child_id references in malformed files.

@@ -15,7 +15,9 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 using namespace klee::mapofsets;
 
 DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
-    : max_cache_size_(max_cache_size) {
+    // A bound of 0 would make get_chunk evict from an empty LRU list (UB);
+    // clamp to at least one resident chunk.
+    : max_cache_size_(max_cache_size ? max_cache_size : 1) {
   auto fail = [&](const char *msg) {
     klee_warning("%s: %s", msg, filename.c_str());
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
@@ -311,8 +313,9 @@ std::vector<std::string>
 DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
   if (!valid_) return {};
   std::vector<std::string> results;
+  std::vector<bool> visited(header_file_.header().total_nodes(), false);
   find_supersets(header_file_.header().root_id(),
-                 query_set.begin(), query_set.end(), results);
+                 query_set.begin(), query_set.end(), visited, results);
   return results;
 }
 
@@ -320,7 +323,20 @@ void DiskMapOfSets::find_supersets(
     uint32_t node_id,
     std::set<std::string>::const_iterator q_begin,
     std::set<std::string>::const_iterator q_end,
+    std::vector<bool> &visited,
     std::vector<std::string> &results) {
+  // Cycle guard for malformed files: the branches below can recurse without
+  // shrinking the query, so a corrupt child_id cycle would not self-terminate.
+  if (node_id < visited.size()) {
+    if (visited[node_id]) {
+      klee_warning("DiskMapOfSets: cycle detected at node %u during superset "
+                   "search; marking cache invalid", node_id);
+      valid_ = false;
+      return;
+    }
+    visited[node_id] = true;
+  }
+
   // Snapshot before recursing: a recursive call can evict this node's chunk.
   NodeView node = get_node_view(node_id);
 
@@ -329,7 +345,7 @@ void DiskMapOfSets::find_supersets(
       results.push_back(read_value(node.value_offset));
 
     for (const auto &child : node.children)
-      find_supersets(child.child_id, q_begin, q_end, results);
+      find_supersets(child.child_id, q_begin, q_end, visited, results);
   } else {
     const std::string &elt = *q_begin;
     auto next_q = std::next(q_begin);
@@ -338,10 +354,10 @@ void DiskMapOfSets::find_supersets(
       const std::string &child_key = key_str(child.key_index);
 
       if (child_key == elt) {
-        find_supersets(child.child_id, next_q, q_end, results);
+        find_supersets(child.child_id, next_q, q_end, visited, results);
       } else if (child_key < elt) {
         // Extra superset element; follow without advancing the query.
-        find_supersets(child.child_id, q_begin, q_end, results);
+        find_supersets(child.child_id, q_begin, q_end, visited, results);
       } else {
         break; // child_key > elt: remaining sorted children all overshoot.
       }

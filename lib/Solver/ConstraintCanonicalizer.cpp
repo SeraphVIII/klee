@@ -166,6 +166,8 @@ static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
   case Expr::AShr: return AShrExpr::create(kids[0], kids[1]);
   case Expr::ZExt: return ZExtExpr::create(kids[0], orig->getWidth());
   case Expr::SExt: return SExtExpr::create(kids[0], orig->getWidth());
+  case Expr::Not:  return NotExpr::create(kids[0]);
+  case Expr::NotOptimized: return NotOptimizedExpr::create(kids[0]);
   case Expr::Select:
     return SelectExpr::create(kids[0], kids[1], kids[2]);
   case Expr::Concat:
