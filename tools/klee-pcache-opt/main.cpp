@@ -744,12 +744,10 @@ int main(int argc, char **argv) {
       unsatTrie.insert(e.key_set, e.value);
     }
 
-    if (result.lookup(e.key_set) != nullptr) {
+    auto it = satKeyToSource.find(e.key_set);
+    if (it != satKeyToSource.end()) {
       ++satConflicts;
-      auto it = satKeyToSource.find(e.key_set);
-      std::string satSrc =
-          (it != satKeyToSource.end()) ? it->second : "<unknown>";
-      conflicts.push_back({e.key_set, satSrc, e.source});
+      conflicts.push_back({e.key_set, it->second, e.source});
     }
 
     // UNSAT overwrites any conflicting SAT.
@@ -859,7 +857,7 @@ int main(int argc, char **argv) {
 
   if (statsOnly) {
     fprintf(stdout, "\n(--stats: no output written)\n");
-    return conflicts.empty() ? 0 : 2;
+    return 0;
   }
 
   CacheMetadata meta;
@@ -869,5 +867,5 @@ int main(int argc, char **argv) {
   MapOfSetsDiskBuilder::build(result, outputPath, meta, chunkSize);
 
   fprintf(stdout, "\nWritten to   : %s\n", outputPath.c_str());
-  return conflicts.empty() ? 0 : 2;
+  return 0;
 }
