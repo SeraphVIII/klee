@@ -217,8 +217,11 @@ DiskMapOfSets::NodeView DiskMapOfSets::get_node_view(uint32_t node_id) {
 
 const std::string &DiskMapOfSets::key_str(uint32_t index) const {
   if (index >= string_table_.size()) {
-    klee_error("DiskMapOfSets: key_index %u out of range (table size %zu)",
-               index, string_table_.size());
+    klee_warning("DiskMapOfSets: key_index %u out of range (table size %zu); "
+                 "marking cache invalid", index, string_table_.size());
+    valid_ = false;
+    static const std::string kEmpty;
+    return kEmpty;
   }
   return string_table_[index];
 }

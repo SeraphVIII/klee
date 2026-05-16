@@ -216,8 +216,7 @@ static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
   case Expr::Constant:
     return orig;
   case Expr::Read: {
-    // Update list is already on canonical arrays (ArraySubstitutionVisitor);
-    // rebuild with the canonicalized index rather than dropping it.
+    // Update list normalised one level up in canonicalizeExprTreeMemo.
     const ReadExpr *re = cast<ReadExpr>(orig);
     return ReadExpr::create(re->updates, kids[0]);
   }
@@ -311,7 +310,28 @@ canonicalizeExprTreeMemo(const ref<Expr> &e,
     kids.push_back(canonicalizeExprTreeMemo(e->getKid(i), memo));
 
   ref<Expr> result;
-  if (isCommutativeKind(e->getKind())) {
+  if (e->getKind() == Expr::Read) {
+    // ArraySubstitutionVisitor renames arrays in writes but leaves commutative
+    // subtrees unsorted; canonicalise un->index / un->value here too so
+    // equivalent constraints hash to the same disk key.
+    const ReadExpr *re = cast<ReadExpr>(e.get());
+    const UpdateList &ul = re->updates;
+    if (!ul.head) {
+      result = ReadExpr::create(ul, kids[0]);
+    } else {
+      std::vector<ref<UpdateNode>> nodes;
+      for (ref<UpdateNode> un = ul.head; un; un = un->next)
+        nodes.push_back(un);
+      UpdateList newUL(ul.root, nullptr);
+      // extend() prepends; replay oldest-first to preserve head=newest.
+      for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit) {
+        ref<Expr> newIdx = canonicalizeExprTreeMemo((*rit)->index, memo);
+        ref<Expr> newVal = canonicalizeExprTreeMemo((*rit)->value, memo);
+        newUL.extend(newIdx, newVal);
+      }
+      result = ReadExpr::create(newUL, kids[0]);
+    }
+  } else if (isCommutativeKind(e->getKind())) {
     ref<Expr> tmp = rebuildWithKids(e, kids);
     result = flattenAndRebuildAssoc(tmp);
   } else {

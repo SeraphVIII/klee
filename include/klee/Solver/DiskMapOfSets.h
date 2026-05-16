@@ -45,7 +45,8 @@ public:
   std::vector<Entry> allEntries();
 
 private:
-  bool valid_ = false;
+  // mutable: const accessors (key_str) clear it on corruption.
+  mutable bool valid_ = false;
   int fd_ = -1;
   void* mmap_base_ = nullptr;
   size_t file_size_ = 0;
