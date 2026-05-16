@@ -857,7 +857,7 @@ int main(int argc, char **argv) {
 
   if (statsOnly) {
     fprintf(stdout, "\n(--stats: no output written)\n");
-    return 0;
+    return conflicts.empty() ? 0 : 2;
   }
 
   CacheMetadata meta;
@@ -867,5 +867,5 @@ int main(int argc, char **argv) {
   MapOfSetsDiskBuilder::build(result, outputPath, meta, chunkSize);
 
   fprintf(stdout, "\nWritten to   : %s\n", outputPath.c_str());
-  return 0;
+  return conflicts.empty() ? 0 : 2;
 }

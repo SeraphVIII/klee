@@ -1,7 +1,7 @@
 // A SAT/UNSAT collision at the same canonical key must be detected by the
-// offline tool: an INCONSISTENCY line on stderr and a conflicts counter on
-// stdout. UNSAT is taken as authoritative; the tool still exits cleanly so the
-// CI pipeline can choose to gate on the stderr text rather than the exit code.
+// offline tool: an INCONSISTENCY line on stderr, a conflicts counter on stdout,
+// and exit code 2 so CI pipelines can gate on it. UNSAT is taken as
+// authoritative; the cache file (or --stats summary) is still produced.
 //
 // The conflict is constructed by post-processing a real log: the helper script
 // clones the first SAT record with its value field zeroed, so the cloned entry
@@ -15,8 +15,9 @@
 // Doctor the log to introduce a collision.
 // RUN: %S/PersistentCexCacheConflictGen.py %t.log
 //
-// The optimiser must announce the collision on both streams.
-// RUN: %klee-pcache-opt --log %t.log --stats > %t.out 2> %t.err
+// The optimiser must announce the collision on both streams and exit with
+// status 2. `not` flips a non-zero exit to success.
+// RUN: not %klee-pcache-opt --log %t.log --stats > %t.out 2> %t.err
 // RUN: grep "^INCONSISTENCY " %t.err
 // RUN: grep "SAT/UNSAT inconsistenc" %t.err
 // RUN: grep -E "SAT/UNSAT conflicts.+: [1-9][0-9]*" %t.out
