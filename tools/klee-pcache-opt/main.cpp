@@ -9,8 +9,7 @@
 //
 // Offline optimiser for KLEE persistent solver caches.  Merges a cache file
 // and/or log files, optionally applies solver-backed transformation passes,
-// and rewrites the result.  See offline_optimiser_design.md for the design
-// rationale and pass semantics.
+// and rewrites the result.
 //
 //===----------------------------------------------------------------------===//
 
@@ -227,8 +226,8 @@ static void printUsage(const char *prog) {
       "                         via iterative delta-debugging (calls solver)\n"
       "  --split-independent    Split SAT entries whose constraints touch\n"
       "                         disjoint byte ranges into separate sub-entries\n"
-      "  --compact-witnesses    Truncate each SAT value blob to the byte range\n"
-      "                         its constraints actually reference\n"
+      "  --compact-witnesses    Drop entire unreferenced arrays from each SAT\n"
+      "                         value blob (referenced arrays are kept whole)\n"
       "  --discover-unsat-pairs Try every pair of cache constraints sharing an\n"
       "                         array; SAT-side pairs are ignored, UNSAT pairs\n"
       "                         become new 2-element entries\n"
