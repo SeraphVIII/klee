@@ -25,7 +25,9 @@
 
 #include <cstring>
 
+#include <fstream>
 #include <iostream>
+#include <iterator>
 
 using namespace klee;
 
@@ -756,6 +758,289 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
 
   std::remove(gen1File.c_str());
   std::remove(gen2File.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Constraint canonicalizer tests
+//
+// canonicalizeExprTree / buildConstraintDiskKey were only exercised indirectly
+// (through the DiskCexCache round-trips above). These cover the canonicaliser
+// directly: every kid-bearing Expr kind must rebuild, and equivalent constraint
+// sets must collapse to one key.
+// ---------------------------------------------------------------------------
+
+// Canonical arrays are created into the passed ArrayCache and referenced by the
+// result expressions, so the cache must outlive them.
+static ArrayCache canonAC;
+
+static ref<Expr> readByte0(const Array *a) {
+  return ReadExpr::create(UpdateList(a, nullptr),
+                          ConstantExpr::create(0, Expr::Int32));
+}
+
+// Regression: NotExpr and NotOptimizedExpr both carry kids but were missing
+// from rebuildWithKids' switch, so canonicalising any expression containing
+// them hit llvm_unreachable (abort with assertions on, UB otherwise). They
+// reach the canonicaliser on the live query path via the negated query
+// expression and klee_assume optimisation barriers.
+TEST(CanonicalizerTest, NotAndNotOptimizedDoNotCrash) {
+  const Array *a = canonAC.CreateArray("not_a", 4);
+  ref<Expr> r0 = readByte0(a);
+  ref<Expr> r1 = ReadExpr::create(UpdateList(a, nullptr),
+                                  ConstantExpr::create(1, Expr::Int32));
+
+  // Symbolic operands, so create() yields real Not / NotOptimized nodes
+  // (NotExpr::create only folds constants; NotOptimizedExpr::create never folds).
+  ref<Expr> notE =
+      NotExpr::create(EqExpr::create(r0, ConstantExpr::create(0, Expr::Int8)));
+  ASSERT_EQ(Expr::Not, notE->getKind()) << "test needs a real NotExpr";
+
+  ref<Expr> noE = NotOptimizedExpr::create(
+      EqExpr::create(r1, ConstantExpr::create(5, Expr::Int8)));
+  ASSERT_EQ(Expr::NotOptimized, noE->getKind())
+      << "test needs a real NotOptimizedExpr";
+
+  // Pre-fix, each of these aborts inside rebuildWithKids.
+  ref<Expr> cNot = canonicalizeExprTree(notE);
+  ASSERT_FALSE(cNot.isNull());
+  EXPECT_EQ(Expr::Not, cNot->getKind()) << "NotExpr must be rebuilt, not dropped";
+
+  ref<Expr> cNo = canonicalizeExprTree(noE);
+  ASSERT_FALSE(cNo.isNull());
+  EXPECT_EQ(Expr::NotOptimized, cNo->getKind())
+      << "NotOptimizedExpr must be rebuilt, not dropped";
+
+  // The full key-building pipeline must also survive and emit one string each.
+  std::vector<ref<Expr>> vec = {notE, noE};
+  auto [key, canon] = buildConstraintDiskKey(vec, canonAC);
+  EXPECT_EQ(2u, key.size());
+}
+
+// (a+b)+c and c+(b+a) are equal modulo commutativity and associativity. The
+// base ExprBuilder does not reassociate or sort symbolic Add operands
+// (AddExpr_create only pulls out constants), so unifying these is the
+// canonicaliser's job (flattenAndRebuildAssoc).
+TEST(CanonicalizerTest, CommutativeAssociativeSameKey) {
+  ref<Expr> ra = readByte0(canonAC.CreateArray("comm_a", 4));
+  ref<Expr> rb = readByte0(canonAC.CreateArray("comm_b", 4));
+  ref<Expr> rc = readByte0(canonAC.CreateArray("comm_c", 4));
+  ref<Expr> zero = ConstantExpr::create(0, Expr::Int8);
+
+  ref<Expr> e1 = EqExpr::create(
+      AddExpr::create(AddExpr::create(ra, rb), rc), zero); // (a+b)+c == 0
+  ref<Expr> e2 = EqExpr::create(
+      AddExpr::create(rc, AddExpr::create(rb, ra)), zero); // c+(b+a) == 0
+
+  std::vector<ref<Expr>> v1 = {e1}, v2 = {e2};
+  auto k1 = buildConstraintDiskKey(v1, canonAC).first;
+  auto k2 = buildConstraintDiskKey(v2, canonAC).first;
+  EXPECT_EQ(k1, k2)
+      << "commutative + associative reshaping must canonicalize identically";
+}
+
+// Structurally isomorphic constraint sets -- same shape, different arrays,
+// supplied in a different order -- must produce identical keys: alpha-renaming
+// to A0,A1,... plus order-independent constraint sorting. Distinct constants
+// pin the canonical array numbering so the renaming is deterministic.
+TEST(CanonicalizerTest, RenamingAndOrderIndependence) {
+  ref<Expr> one = ConstantExpr::create(1, Expr::Int8);
+  ref<Expr> two = ConstantExpr::create(2, Expr::Int8);
+
+  const Array *p = canonAC.CreateArray("ren_p", 4);
+  const Array *q = canonAC.CreateArray("ren_q", 4);
+  std::vector<ref<Expr>> setA = {EqExpr::create(readByte0(p), one),
+                                 EqExpr::create(readByte0(q), two)};
+  std::vector<ref<Expr>> setB = {setA[1], setA[0]}; // reversed input order
+
+  const Array *r = canonAC.CreateArray("ren_r", 4);
+  const Array *s = canonAC.CreateArray("ren_s", 4);
+  std::vector<ref<Expr>> setC = {EqExpr::create(readByte0(r), one),
+                                 EqExpr::create(readByte0(s), two)};
+
+  auto kA = buildConstraintDiskKey(setA, canonAC).first;
+  auto kB = buildConstraintDiskKey(setB, canonAC).first;
+  auto kC = buildConstraintDiskKey(setC, canonAC).first;
+
+  EXPECT_EQ(kA, kB) << "input ordering must not affect the canonical key";
+  EXPECT_EQ(kA, kC) << "array identity must not affect the canonical key";
+  EXPECT_EQ(2u, kA.size()) << "the two distinct constraints must stay distinct";
+}
+
+// ---------------------------------------------------------------------------
+// Malformed-file / robustness tests for DiskMapOfSets and DiskCexCache.
+// ---------------------------------------------------------------------------
+
+// Patch a built cache file so node 1's first child points back to node 1,
+// forming a child_id cycle the tree builder can never produce. The new
+// child_id (1) and the original (2) are both single-byte non-zero varints, so
+// the chunk's serialized size is unchanged and the directory offsets stay
+// valid. Returns false if anything about that assumption does not hold.
+static bool patchSelfLoopOnNode1(const std::string &file) {
+  std::ifstream in(file, std::ios::binary);
+  std::string data((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  in.close();
+  if (data.size() < 16)
+    return false;
+
+  uint64_t headerSize = 0;
+  memcpy(&headerSize, data.data() + 8, 8);
+
+  klee::mapofsets::MapOfSetsFile mf;
+  if (!mf.ParseFromArray(data.data() + 16, static_cast<int>(headerSize)))
+    return false;
+  uint64_t dirOff = mf.header().directory_offset();
+  if (dirOff + 12 > data.size())
+    return false;
+
+  uint64_t chunkOff = 0;
+  uint32_t chunkSz = 0;
+  memcpy(&chunkOff, data.data() + dirOff, 8);
+  memcpy(&chunkSz, data.data() + dirOff + 8, 4);
+  if (chunkOff + chunkSz > data.size())
+    return false;
+
+  klee::mapofsets::NodeChunk nc;
+  if (!nc.ParseFromArray(data.data() + chunkOff, static_cast<int>(chunkSz)))
+    return false;
+  if (nc.nodes_size() < 2 || nc.nodes(1).children_size() < 1)
+    return false;
+
+  nc.mutable_nodes(1)->mutable_children(0)->set_child_id(1); // self-loop
+
+  std::string patched;
+  nc.SerializeToString(&patched);
+  if (patched.size() != chunkSz)
+    return false; // size drift would corrupt downstream offsets
+
+  data.replace(chunkOff, chunkSz, patched);
+  std::ofstream out(file, std::ios::binary | std::ios::trunc);
+  out.write(data.data(), static_cast<std::streamsize>(data.size()));
+  return true;
+}
+
+// A child_id cycle in a corrupt file must be detected, not infinitely recursed.
+// find_supersets' empty-query / extra-element branches recurse without
+// shrinking the query, so they rely on the visited guard to terminate.
+TEST(DiskMapOfSetsTest, SupersetCycleGuard) {
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({"a", "b"}, "SAT_ab");
+  mem.insert({"a", "c"}, "SAT_ac");
+
+  const std::string testFile = "cycle_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+
+  // The intact file answers supersets({"a"}) with both stored sets.
+  {
+    klee::mapofsets::DiskMapOfSets ok(testFile);
+    ASSERT_TRUE(ok.isValid());
+    EXPECT_EQ(2u, ok.supersets({"a"}).size());
+  }
+
+  ASSERT_TRUE(patchSelfLoopOnNode1(testFile))
+      << "failed to inject a child_id cycle into the cache file";
+
+  klee::mapofsets::DiskMapOfSets disk(testFile);
+  ASSERT_TRUE(disk.isValid()); // constructor does not traverse nodes
+  disk.supersets({"a"});       // must terminate, not stack-overflow
+  EXPECT_FALSE(disk.isValid())
+      << "a child_id cycle must invalidate the cache, not loop forever";
+
+  std::remove(testFile.c_str());
+}
+
+// A max_cache_size of 0 must be clamped to >= 1: otherwise the first get_chunk
+// evicts from an empty LRU list (back()/pop_back() on an empty std::list = UB).
+// chunkSize=1 forces a fresh chunk load (and an eviction) on every lookup.
+TEST(DiskMapOfSetsTest, ZeroLruCacheSizeClamped) {
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert({"a"}, "val_a");
+  mem.insert({"a", "b"}, "val_ab");
+
+  const std::string testFile = "zero_lru_disk_cache.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile, /*metadata=*/{},
+                                    /*chunkSize=*/1);
+
+  klee::mapofsets::DiskMapOfSets disk(testFile, /*max_cache_size=*/0);
+  EXPECT_EQ("val_a", *disk.lookup({"a"}));
+  EXPECT_EQ("val_ab", *disk.lookup({"a", "b"}));
+  EXPECT_EQ(2u, disk.supersets({"a"}).size()); // repeated load+evict cycles
+
+  std::remove(testFile.c_str());
+}
+
+// The canonical key does not encode array size, so a stored witness can be
+// wider than the live array when their key strings collide. The returned
+// assignment must be resized to exactly the live array's size (truncate/
+// zero-pad) and re-verified -- handing back the stored width would trip
+// IndependentSolver's byte-count assertion.
+TEST(DiskCexCacheTest, ResizesWitnessToLiveArraySize) {
+  auto keyOf = [](const CanonicalizationResult &c) {
+    std::set<std::string> k;
+    for (const auto &e : c.constraints) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      ExprPPrinter::printSingleExpr(os, e);
+      os.flush();
+      k.insert(s);
+    }
+    return k;
+  };
+
+  // Store a witness for an 8-byte array: big[0] == 42.
+  const Array *big = diskCexAC.CreateArray("mm_big", 8);
+  ref<Expr> readBig = ReadExpr::create(
+      UpdateList(big, nullptr), ConstantExpr::create(0, Expr::Int32));
+  ref<Expr> cBig = EqExpr::create(readBig, ConstantExpr::create(42, Expr::Int8));
+
+  ArrayCache canonBig;
+  std::vector<ref<Expr>> vbig = {cBig};
+  CanonicalizationResult canon = canonicalizeConstraintSet(vbig, canonBig);
+  std::set<std::string> diskKey = keyOf(canon);
+
+  std::vector<unsigned char> bigBytes(8, 0);
+  bigBytes[0] = 42;
+  std::vector<const Array *> objs = {big};
+  std::vector<std::vector<unsigned char>> vals = {bigBytes};
+  Assignment a(objs, vals);
+  std::string value =
+      DiskCexCache::serializeAssignment(&a, canon.forwardArrayMap);
+
+  klee::MapOfSets<std::string, std::string> mem;
+  mem.insert(diskKey, value);
+  const std::string testFile = "size_mismatch.mapo";
+  klee::MapOfSetsDiskBuilder::build(mem, testFile);
+
+  // Query with a 4-byte array, same constraint shape.
+  const Array *small = diskCexAC.CreateArray("mm_small", 4);
+  ref<Expr> readSmall = ReadExpr::create(
+      UpdateList(small, nullptr), ConstantExpr::create(0, Expr::Int32));
+  ref<Expr> cSmall =
+      EqExpr::create(readSmall, ConstantExpr::create(42, Expr::Int8));
+
+  // Setup invariant: the canonical keys really do collide (size is not in the
+  // key), so the miss below is attributable to the size guard, not a key miss.
+  ArrayCache canonSmall;
+  std::vector<ref<Expr>> vsmall = {cSmall};
+  ASSERT_EQ(diskKey, keyOf(canonicalizeConstraintSet(vsmall, canonSmall)))
+      << "test setup: keys must collide for this to exercise the size guard";
+
+  DiskCexCache cache(testFile);
+
+  // The 8-byte witness truncates to [42,0,0,0], which satisfies small[0]==42.
+  std::set<ref<Expr>> qSmall = {cSmall};
+  Assignment *res = nullptr;
+  ASSERT_TRUE(cache.findSubset(qSmall, res))
+      << "resized witness should still satisfy small[0]==42";
+  ASSERT_NE(nullptr, res);
+  auto it = res->bindings.find(small);
+  ASSERT_NE(res->bindings.end(), it);
+  EXPECT_EQ(4u, it->second.size())
+      << "witness must be resized to the live array's size, not the stored 8";
+  EXPECT_EQ(42u, it->second[0]);
+  EXPECT_TRUE(res->satisfies(qSmall.begin(), qSmall.end()));
+
+  std::remove(testFile.c_str());
 }
 
 }
