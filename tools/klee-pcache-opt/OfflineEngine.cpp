@@ -134,6 +134,50 @@ OfflineEngine::getUnsatCore(const std::vector<ref<Expr>> &constraints) {
   return res;
 }
 
+// Rewrite ExprPPrinter expression labels (`N<k>`, definitions and refs alike)
+// with a running per-constraint offset. ExprPPrinter::printSingleExpr emits
+// each constraint with a fresh counter starting at N0, so stitching multiple
+// constraints into one synthetic KQuery collides label scopes; offsetting
+// makes the union unambiguous without touching the on-disk key text.
+static std::string renumberExprLabels(const std::string &in,
+                                      unsigned &offset) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  unsigned localMax = 0;
+  bool any = false;
+  const size_t n = in.size();
+  size_t i = 0;
+  while (i < n) {
+    bool startBoundary =
+        (i == 0) ||
+        !(std::isalnum(static_cast<unsigned char>(in[i - 1])) ||
+          in[i - 1] == '_');
+    if (startBoundary && in[i] == 'N' && i + 1 < n &&
+        std::isdigit(static_cast<unsigned char>(in[i + 1]))) {
+      size_t j = i + 1;
+      while (j < n && std::isdigit(static_cast<unsigned char>(in[j])))
+        ++j;
+      bool endBoundary =
+          (j == n) ||
+          !(std::isalnum(static_cast<unsigned char>(in[j])) || in[j] == '_');
+      if (endBoundary) {
+        unsigned k = static_cast<unsigned>(
+            std::strtoul(in.c_str() + i + 1, nullptr, 10));
+        out.push_back('N');
+        out += std::to_string(k + offset);
+        if (k > localMax) localMax = k;
+        any = true;
+        i = j;
+        continue;
+      }
+    }
+    out.push_back(in[i]);
+    ++i;
+  }
+  if (any) offset += localMax + 1;
+  return out;
+}
+
 // Hand-rolled scan for A<digits> identifiers; the canonicalizer never emits
 // any other shape so this is sufficient.
 void OfflineEngine::collectArrayNames(const std::string &s,
@@ -211,10 +255,11 @@ ParsedKey OfflineEngine::parseKey(
   }
   src << "(query [";
   bool first = true;
+  unsigned labelOffset = 0;
   for (const auto &c : key) {
     if (!first)
       src << ' ';
-    src << c;
+    src << renumberExprLabels(c, labelOffset);
     first = false;
   }
   src << "] false)\n";
