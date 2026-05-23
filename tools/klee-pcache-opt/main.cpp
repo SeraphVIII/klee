@@ -30,6 +30,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 using namespace klee;
@@ -633,17 +634,45 @@ int main(int argc, char **argv) {
       size_t i, j;
       uint32_t overlapWeight;
     };
-    std::vector<PairCandidate> candidates;
-    for (size_t i = 0; i < uniq.size(); ++i) {
-      const auto &arrsA = stringArrays[uniq[i]];
-      for (size_t j = i + 1; j < uniq.size(); ++j) {
-        const auto &arrsB = stringArrays[uniq[j]];
-        uint32_t overlap = 0;
-        for (const auto &s : arrsA) if (arrsB.count(s)) ++overlap;
-        if (overlap == 0) { ++pairsSkippedNoOverlap; continue; }
-        candidates.push_back({i, j, overlap});
-      }
+
+    // Inverted index: array name -> sorted constraint indices using it.
+    // Enumerating pairs within each array's bucket avoids the O(N^2) pass
+    // over disjoint pairs, which dominated on cat (~5k constraints, ~12M
+    // pairs, ~95% disjoint). Per-pair overlap accumulates in pairToOverlap.
+    if (uniq.size() > (size_t{1} << 32)) {
+      fprintf(stderr,
+              "discover-unsat-pairs: too many unique constraints (%zu) "
+              "to pack pair indices into 64 bits\n", uniq.size());
+      return 1;
     }
+    std::unordered_map<std::string, std::vector<uint32_t>> arrayToCs;
+    for (size_t i = 0; i < uniq.size(); ++i) {
+      for (const auto &a : stringArrays[uniq[i]])
+        arrayToCs[a].push_back(static_cast<uint32_t>(i));
+    }
+
+    auto packPair = [](uint32_t i, uint32_t j) {
+      return (static_cast<uint64_t>(i) << 32) | j;
+    };
+    std::unordered_map<uint64_t, uint32_t> pairToOverlap;
+    for (auto &kv : arrayToCs) {
+      auto &cs = kv.second; // ascending by construction above
+      for (size_t a = 0; a < cs.size(); ++a)
+        for (size_t b = a + 1; b < cs.size(); ++b)
+          ++pairToOverlap[packPair(cs[a], cs[b])];
+    }
+
+    std::vector<PairCandidate> candidates;
+    candidates.reserve(pairToOverlap.size());
+    for (const auto &kv : pairToOverlap) {
+      uint32_t i = static_cast<uint32_t>(kv.first >> 32);
+      uint32_t j = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
+      candidates.push_back({i, j, kv.second});
+    }
+
+    const uint64_t totalPairs =
+        static_cast<uint64_t>(uniq.size()) * (uniq.size() - 1) / 2;
+    pairsSkippedNoOverlap = totalPairs - candidates.size();
 
     std::sort(candidates.begin(), candidates.end(),
               [&](const PairCandidate &a, const PairCandidate &b) {
@@ -733,21 +762,33 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    // A stored SAT entry with this exact key set is an input inconsistency.
+    // Detect it independently of dominance pruning so the conflict is always
+    // reported: a dominated UNSAT superset is redundant for lookups, but its
+    // contradiction with the SAT entry is still real and must not be hidden.
+    auto satIt = satKeyToSource.find(e.key_set);
+    const bool conflictsWithSat = (satIt != satKeyToSource.end());
+    if (conflictsWithSat) {
+      ++satConflicts;
+      conflicts.push_back({e.key_set, satIt->second, e.source});
+    }
+
     if (pruneUnsat) {
       // e.key_set is not yet in unsatTrie, so a hit is a strict subset.
       std::vector<std::pair<std::set<std::string>, std::string>> subs;
       unsatTrie.subsets(e.key_set, subs);
       if (!subs.empty()) {
-        ++unsatDominated;
+        // Redundant for lookups: a strict UNSAT subset already answers every
+        // superset query. Drop it -- unless it contradicts a stored SAT entry,
+        // in which case still overwrite so the output does not retain a SAT
+        // witness for a key set we know is UNSAT.
+        if (conflictsWithSat)
+          result.insert(e.key_set, e.value);
+        else
+          ++unsatDominated;
         continue;
       }
       unsatTrie.insert(e.key_set, e.value);
-    }
-
-    auto it = satKeyToSource.find(e.key_set);
-    if (it != satKeyToSource.end()) {
-      ++satConflicts;
-      conflicts.push_back({e.key_set, it->second, e.source});
     }
 
     // UNSAT overwrites any conflicting SAT.
