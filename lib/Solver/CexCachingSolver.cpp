@@ -120,6 +120,14 @@ cl::opt<bool>
                               "before asking the SMT solver (default=false)"),
                      cl::cat(SolvingCat));
 
+cl::opt<bool> CanonicalizeCexKey(
+    "canonicalize-cex-key", cl::init(false),
+    cl::desc("Canonicalize expression trees (commutative/associative operand "
+             "ordering, no array renaming) before the in-memory cex-cache "
+             "lookup; for measuring the in-memory hit-rate effect of "
+             "canonicalization (default=false)"),
+    cl::cat(SolvingCat));
+
 } // namespace
 
 ///
@@ -351,6 +359,16 @@ bool CexCachingSolver::lookupAssignment(const Query &query,
     }
   } else {
     key.insert(neg);
+  }
+
+  // Canonicalize expression trees so commutatively/associatively equivalent
+  // queries collide in the in-memory cache. Arrays are left untouched, so the
+  // cached Assignment (over the original arrays) stays valid for this query and
+  // findSymbolicObjects still recovers the same objects.
+  if (CanonicalizeCexKey) {
+    std::vector<ref<Expr>> vec(key.begin(), key.end());
+    std::vector<ref<Expr>> canon = canonicalizeExprTreesOnly(vec);
+    key = KeyType(canon.begin(), canon.end());
   }
 
   bool found = searchForAssignment(key, result);

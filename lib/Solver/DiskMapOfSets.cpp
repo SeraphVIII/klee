@@ -77,8 +77,9 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
   }
 
   // Stale-key files (older canonicalization) must be rebuilt rather than
-  // silently producing all misses.
-  static constexpr uint32_t kExpectedCanonVersion = 1;
+  // silently producing all misses. Keep in lockstep with kCanonVersion in
+  // MapOfSetsDiskBuilder.cpp (v2: iterative canonicalizer traversal).
+  static constexpr uint32_t kExpectedCanonVersion = 2;
   uint32_t canon_version = header_file_.header().canonicalization_version();
   if (canon_version != kExpectedCanonVersion) {
     fail("DiskMapOfSets: canonicalization version mismatch (delete and re-run) in");

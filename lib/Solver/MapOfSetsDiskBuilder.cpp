@@ -111,7 +111,10 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   hdr->set_version(1);
   // Bump on any canonicalization or key-serialization change so readers
   // reject stale cache files.
-  static constexpr uint32_t kCanonVersion = 1;
+  // v2: canonicalizer DFS walks converted from recursion to explicit-stack
+  // iteration (deep KLEE expressions overflowed the C++ stack); the traversal
+  // change can perturb canonical key bytes, so v1 caches must not be reused.
+  static constexpr uint32_t kCanonVersion = 2;
   hdr->set_canonicalization_version(kCanonVersion);
   if (!metadata.solverBackend.empty())
     hdr->set_solver_backend(metadata.solverBackend);

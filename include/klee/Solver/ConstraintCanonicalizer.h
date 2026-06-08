@@ -27,6 +27,16 @@ struct CanonicalizationResult {
 
 klee::ref<Expr> canonicalizeExprTree(klee::ref<Expr> e);
 
+/// Canonicalize the expression tree of each constraint (commutative/associative
+/// operand ordering) WITHOUT alpha-renaming arrays. Because array identities are
+/// preserved, an Assignment computed for the original constraints stays valid
+/// for the canonicalized ones — unlike buildConstraintDiskKey, which renames
+/// arrays for cross-run disk keys. Used to measure the in-memory
+/// counterexample-cache hit-rate effect of canonicalization
+/// (the --canonicalize-cex-key flag).
+std::vector<klee::ref<Expr>>
+canonicalizeExprTreesOnly(const std::vector<klee::ref<Expr>> &constraints);
+
 CanonicalizationResult
 canonicalizeConstraintSet(const std::vector<klee::ref<Expr>> &constraints,
                           ArrayCache &arrayCache);

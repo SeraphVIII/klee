@@ -10,82 +10,169 @@
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 using namespace klee;
 
 namespace {
 
-// Three-way compare matching ExprCanonicalOrder's order, memoised on (a,b)
-// pairs: Expr operands are shared DAGs, so an unmemoised recursion is
-// exponential in the sharing factor. Returns <0 / 0 / >0.
-int compareExpr(const ref<Expr> &a, const ref<Expr> &b,
-                std::map<std::pair<const Expr *, const Expr *>, int> &memo) {
-  if (a.get() == b.get())
-    return 0;
+// ---------------------------------------------------------------------------
+// All DAG traversals below are explicit-stack iterative rather than recursive.
+// KLEE expression trees can be thousands of levels deep on long-running states
+// (e.g. coreutils at multi-million instruction budgets), and a recursive DFS
+// would recurse to the full tree depth and overflow the C++ stack. Memoisation
+// bounds total *work* but not stack *depth*, so the recursion has to go.
+// ---------------------------------------------------------------------------
 
-  std::pair<const Expr *, const Expr *> key(a.get(), b.get());
-  auto it = memo.find(key);
-  if (it != memo.end())
-    return it->second;
-
-  int result;
+// Shallow (no-descent) part of the structural comparison. Returns true and
+// sets `out` when (a,b) can be ordered without comparing children; returns
+// false when the caller must compare children (Read index + update list, or
+// the kids of an internal node).
+bool compareShallow(const Expr *a, const Expr *b, int &out) {
+  if (a == b) {
+    out = 0;
+    return true;
+  }
   if (a->getKind() != b->getKind()) {
-    result = a->getKind() < b->getKind() ? -1 : 1;
-  } else if (a->getWidth() != b->getWidth()) {
-    result = a->getWidth() < b->getWidth() ? -1 : 1;
-  } else if (a->getKind() == Expr::Constant) {
+    out = a->getKind() < b->getKind() ? -1 : 1;
+    return true;
+  }
+  if (a->getWidth() != b->getWidth()) {
+    out = a->getWidth() < b->getWidth() ? -1 : 1;
+    return true;
+  }
+  if (a->getKind() == Expr::Constant) {
     const ConstantExpr *ca = cast<ConstantExpr>(a);
     const ConstantExpr *cb = cast<ConstantExpr>(b);
     if (ca->getAPValue().ult(cb->getAPValue()))
-      result = -1;
+      out = -1;
     else if (cb->getAPValue().ult(ca->getAPValue()))
-      result = 1;
+      out = 1;
     else
-      result = 0;
-  } else if (a->getKind() == Expr::Read) {
+      out = 0;
+    return true;
+  }
+  if (a->getKind() == Expr::Read) {
     const ReadExpr *ra = cast<ReadExpr>(a);
     const ReadExpr *rb = cast<ReadExpr>(b);
     int cmp = ra->updates.root->name.compare(rb->updates.root->name);
     if (cmp != 0) {
-      result = cmp < 0 ? -1 : 1;
-    } else {
-      result = compareExpr(ra->index, rb->index, memo);
-      if (result == 0) {
-        // Indices equivalent — also order by the update list so this is a
-        // *total* order. A non-total comparator leaves std::sort's tie order
-        // input-dependent, which would make DFS array naming vary across runs.
-        ref<UpdateNode> ua = ra->updates.head;
-        ref<UpdateNode> ub = rb->updates.head;
-        while (ua && ub && result == 0) {
-          result = compareExpr(ua->index, ub->index, memo);
-          if (result == 0)
-            result = compareExpr(ua->value, ub->value, memo);
-          ua = ua->next;
-          ub = ub->next;
-        }
-        if (result == 0) {
-          if (ua)
-            result = 1; // ra's update list is longer
-          else if (ub)
-            result = -1; // rb's update list is longer
-        }
-      }
+      out = cmp < 0 ? -1 : 1;
+      return true;
+    }
+    return false; // names equal: descend into index + update list
+  }
+  if (a->getNumKids() != b->getNumKids()) {
+    out = a->getNumKids() < b->getNumKids() ? -1 : 1;
+    return true;
+  }
+  return false; // descend into kids
+}
+
+// Ordered list of child (a,b) sub-comparisons for a node that needs descent,
+// in the exact order the result depends on them:
+//   Read     -> [(index,index)] then per paired update node [(idx,idx),(val,val)]
+//   internal -> [(kid0,kid0), ..., (kid_{n-1},kid_{n-1})]
+// The result is the first non-zero of these (then, for Read, an update-list
+// length tie-break). This reproduces the original recursive comparator exactly.
+std::vector<std::pair<ref<Expr>, ref<Expr>>>
+compareChildPairs(const ref<Expr> &a, const ref<Expr> &b) {
+  std::vector<std::pair<ref<Expr>, ref<Expr>>> v;
+  if (a->getKind() == Expr::Read) {
+    const ReadExpr *ra = cast<ReadExpr>(a.get());
+    const ReadExpr *rb = cast<ReadExpr>(b.get());
+    v.emplace_back(ra->index, rb->index);
+    ref<UpdateNode> ua = ra->updates.head;
+    ref<UpdateNode> ub = rb->updates.head;
+    while (ua && ub) {
+      v.emplace_back(ua->index, ub->index);
+      v.emplace_back(ua->value, ub->value);
+      ua = ua->next;
+      ub = ub->next;
     }
   } else {
-    unsigned ak = a->getNumKids();
-    unsigned bk = b->getNumKids();
-    if (ak != bk) {
-      result = ak < bk ? -1 : 1;
+    unsigned n = a->getNumKids();
+    for (unsigned i = 0; i < n; ++i)
+      v.emplace_back(a->getKid(i), b->getKid(i));
+  }
+  return v;
+}
+
+// -1/0/1 by update-list length (longer list ranks greater); meaningful only
+// when both Reads share a name and all paired index/value comparisons tied.
+int updateListLenCmp(const ref<Expr> &a, const ref<Expr> &b) {
+  ref<UpdateNode> ua = cast<ReadExpr>(a.get())->updates.head;
+  ref<UpdateNode> ub = cast<ReadExpr>(b.get())->updates.head;
+  while (ua && ub) {
+    ua = ua->next;
+    ub = ub->next;
+  }
+  if (ua)
+    return 1;
+  if (ub)
+    return -1;
+  return 0;
+}
+
+// Iterative three-way compare matching ExprCanonicalOrder. Memoised on (a,b)
+// pairs (shared DAGs would otherwise be exponential). Returns <0 / 0 / >0.
+int compareExpr(const ref<Expr> &a0, const ref<Expr> &b0,
+                std::map<std::pair<const Expr *, const Expr *>, int> &memo) {
+  struct Frame {
+    ref<Expr> a, b;
+    bool resolve;
+  };
+  std::vector<Frame> stack;
+  stack.push_back({a0, b0, false});
+
+  while (!stack.empty()) {
+    Frame f = stack.back();
+    stack.pop_back();
+    const Expr *ka = f.a.get();
+    const Expr *kb = f.b.get();
+    if (ka == kb)
+      continue; // compareChildPairs/lookups treat a==b as 0 directly
+    std::pair<const Expr *, const Expr *> key(ka, kb);
+
+    if (!f.resolve) {
+      if (memo.count(key))
+        continue;
+      int shallow;
+      if (compareShallow(ka, kb, shallow)) {
+        memo.emplace(key, shallow);
+        continue;
+      }
+      // Needs children: schedule the combine, then the child pairs above it so
+      // they are computed first (LIFO).
+      stack.push_back({f.a, f.b, true});
+      for (auto &cp : compareChildPairs(f.a, f.b))
+        stack.push_back({cp.first, cp.second, false});
     } else {
-      result = 0;
-      for (unsigned i = 0; i < ak && result == 0; ++i)
-        result = compareExpr(a->getKid(i), b->getKid(i), memo);
+      if (memo.count(key))
+        continue;
+      int result = 0;
+      for (auto &cp : compareChildPairs(f.a, f.b)) {
+        const Expr *ca = cp.first.get();
+        const Expr *cb = cp.second.get();
+        if (ca == cb)
+          continue;
+        int r = memo[{ca, cb}];
+        if (r != 0) {
+          result = r;
+          break;
+        }
+      }
+      if (result == 0 && f.a->getKind() == Expr::Read)
+        result = updateListLenCmp(f.a, f.b);
+      memo.emplace(key, result);
     }
   }
 
-  memo.emplace(key, result);
-  return result;
+  if (a0.get() == b0.get())
+    return 0;
+  return memo[{a0.get(), b0.get()}];
 }
 
 } // namespace
@@ -98,68 +185,49 @@ bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
 
 namespace {
 
-// Assigns each Array a DFS first-appearance index, giving canonical names
-// A0, A1, ... independent of allocation order.
-class ArrayOrderCollector : public ExprVisitor {
-  std::unordered_map<const Array *, unsigned> &order_;
-  unsigned &nextIndex_;
+// Iterative DFS assigning each Array a first-appearance index, giving canonical
+// names A0, A1, ... independent of allocation order. Reproduces the previous
+// recursive ExprVisitor pre-order exactly: for a Read, the update-list nodes
+// (index then value, head-first) are visited before the read index, and shared
+// subexpressions are visited once (first encounter wins).
+void collectArrayOrder(const ref<Expr> &root,
+                       std::unordered_map<const Array *, unsigned> &order,
+                       unsigned &nextIndex,
+                       std::unordered_set<const Expr *> &visited) {
+  std::vector<ref<Expr>> stack;
+  stack.push_back(root);
 
-public:
-  ArrayOrderCollector(std::unordered_map<const Array *, unsigned> &order,
-                      unsigned &nextIndex)
-      : ExprVisitor(/*recursive=*/true), order_(order), nextIndex_(nextIndex) {}
+  while (!stack.empty()) {
+    ref<Expr> e = stack.back();
+    stack.pop_back();
+    if (e.isNull() || isa<ConstantExpr>(e))
+      continue;
+    const Expr *k = e.get();
+    if (!visited.insert(k).second)
+      continue;
 
-  Action visitRead(const ReadExpr &re) override {
-    const Array *root = re.updates.root;
-    if (root && !order_.count(root))
-      order_[root] = nextIndex_++;
-
-    for (ref<UpdateNode> un = re.updates.head; un; un = un->next) {
-      visit(un->index);
-      visit(un->value);
+    // children in visitation order
+    std::vector<ref<Expr>> children;
+    if (e->getKind() == Expr::Read) {
+      const ReadExpr *re = cast<ReadExpr>(k);
+      const Array *rootA = re->updates.root;
+      if (rootA && !order.count(rootA))
+        order[rootA] = nextIndex++;
+      for (ref<UpdateNode> un = re->updates.head; un; un = un->next) {
+        children.push_back(un->index);
+        children.push_back(un->value);
+      }
+      children.push_back(re->index);
+    } else {
+      unsigned n = e->getNumKids();
+      for (unsigned i = 0; i < n; ++i)
+        children.push_back(e->getKid(i));
     }
-
-    return ExprVisitor::visitRead(re);
+    // push reversed so children pop in visitation order
+    for (auto it = children.rbegin(); it != children.rend(); ++it)
+      stack.push_back(*it);
   }
-};
-
-// Rewrites ReadExprs onto canonical arrays, walking UpdateList chains so
-// symbolic writes are substituted too.
-class ArraySubstitutionVisitor : public ExprVisitor {
-  const std::map<const Array *, const Array *> &subst_;
-
-public:
-  explicit ArraySubstitutionVisitor(
-      const std::map<const Array *, const Array *> &subst)
-      : ExprVisitor(/*recursive=*/true), subst_(subst) {}
-
-  Action visitRead(const ReadExpr &re) override {
-    const UpdateList &ul = re.updates;
-    const Array *root = ul.root;
-
-    auto it = subst_.find(root);
-    if (it == subst_.end() && !ul.head)
-      return Action::doChildren();
-
-    const Array *newRoot = (it != subst_.end()) ? it->second : root;
-
-    // ul.head is the newest update; reverse so extend() replays oldest-first.
-    std::vector<ref<UpdateNode>> nodes;
-    for (ref<UpdateNode> un = ul.head; un; un = un->next)
-      nodes.push_back(un);
-
-    UpdateList newUL(newRoot, nullptr);
-    for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit) {
-      ref<UpdateNode> un = *rit;
-      ref<Expr> newIdx = visit(un->index);
-      ref<Expr> newVal = visit(un->value);
-      newUL.extend(newIdx, newVal);
-    }
-
-    ref<Expr> newIndex = visit(re.index);
-    return Action::changeTo(ReadExpr::create(newUL, newIndex));
-  }
-};
+}
 
 } // anonymous namespace
 
@@ -216,7 +284,7 @@ static ref<Expr> rebuildWithKids(const ref<Expr> &orig,
   case Expr::Constant:
     return orig;
   case Expr::Read: {
-    // Update list normalised one level up in canonicalizeExprTreeMemo.
+    // Update list normalised by the caller (canonicalizeExprTree).
     const ReadExpr *re = cast<ReadExpr>(orig);
     return ReadExpr::create(re->updates, kids[0]);
   }
@@ -287,66 +355,192 @@ static ref<Expr> flattenAndRebuildAssoc(ref<Expr> e) {
   return elems[0];
 }
 
-// Memoised tree canonicalisation: same exponential-on-shared-DAGs problem as
-// compareExpr. Keying on the original Expr* is sound — canonicalisation is a
-// pure function of node structure.
+namespace {
+
+// Helper for the post-order rebuild passes below: the canonicalised/substituted
+// form of a child. Leaves (constants, zero-kid nodes) map to themselves; every
+// node with kids has been resolved into `memo` before its parent's resolve
+// runs (LIFO post-order), so the lookup is always populated.
 static ref<Expr>
-canonicalizeExprTreeMemo(const ref<Expr> &e,
-                         std::unordered_map<const Expr *, ref<Expr>> &memo) {
-  if (e.isNull())
-    return e;
+resolvedChild(const ref<Expr> &x,
+              const std::unordered_map<const Expr *, ref<Expr>> &memo) {
+  if (x.isNull() || x->getNumKids() == 0)
+    return x;
+  return memo.at(x.get());
+}
 
-  unsigned n = e->getNumKids();
-  if (n == 0)
-    return e;
+// Iterative post-order rewrite of every ReadExpr onto its canonical array,
+// walking UpdateList chains so symbolic writes are substituted too. Pure
+// structural rewrite, so traversal order does not affect the output.
+ref<Expr> substituteArrays(const ref<Expr> &root,
+                           const std::map<const Array *, const Array *> &subst,
+                           std::unordered_map<const Expr *, ref<Expr>> &memo) {
+  struct Frame {
+    ref<Expr> e;
+    bool resolve;
+  };
+  std::vector<Frame> stack;
+  stack.push_back({root, false});
 
-  auto it = memo.find(e.get());
-  if (it != memo.end())
-    return it->second;
+  while (!stack.empty()) {
+    Frame f = stack.back();
+    stack.pop_back();
+    if (f.e.isNull() || f.e->getNumKids() == 0)
+      continue;
+    const Expr *k = f.e.get();
 
-  std::vector<ref<Expr>> kids;
-  kids.reserve(n);
-  for (unsigned i = 0; i < n; ++i)
-    kids.push_back(canonicalizeExprTreeMemo(e->getKid(i), memo));
-
-  ref<Expr> result;
-  if (e->getKind() == Expr::Read) {
-    // ArraySubstitutionVisitor renames arrays in writes but leaves commutative
-    // subtrees unsorted; canonicalise un->index / un->value here too so
-    // equivalent constraints hash to the same disk key.
-    const ReadExpr *re = cast<ReadExpr>(e.get());
-    const UpdateList &ul = re->updates;
-    if (!ul.head) {
-      result = ReadExpr::create(ul, kids[0]);
-    } else {
-      std::vector<ref<UpdateNode>> nodes;
-      for (ref<UpdateNode> un = ul.head; un; un = un->next)
-        nodes.push_back(un);
-      UpdateList newUL(ul.root, nullptr);
-      // extend() prepends; replay oldest-first to preserve head=newest.
-      for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit) {
-        ref<Expr> newIdx = canonicalizeExprTreeMemo((*rit)->index, memo);
-        ref<Expr> newVal = canonicalizeExprTreeMemo((*rit)->value, memo);
-        newUL.extend(newIdx, newVal);
+    if (!f.resolve) {
+      if (memo.count(k))
+        continue;
+      stack.push_back({f.e, true});
+      unsigned n = f.e->getNumKids();
+      for (unsigned i = 0; i < n; ++i)
+        stack.push_back({f.e->getKid(i), false});
+      if (f.e->getKind() == Expr::Read) {
+        const ReadExpr *re = cast<ReadExpr>(k);
+        for (ref<UpdateNode> un = re->updates.head; un; un = un->next) {
+          stack.push_back({un->index, false});
+          stack.push_back({un->value, false});
+        }
       }
-      result = ReadExpr::create(newUL, kids[0]);
+    } else {
+      if (memo.count(k))
+        continue;
+      unsigned n = f.e->getNumKids();
+      std::vector<ref<Expr>> kids;
+      kids.reserve(n);
+      for (unsigned i = 0; i < n; ++i)
+        kids.push_back(resolvedChild(f.e->getKid(i), memo));
+
+      ref<Expr> result;
+      if (f.e->getKind() == Expr::Read) {
+        const ReadExpr *re = cast<ReadExpr>(k);
+        const UpdateList &ul = re->updates;
+        const Array *r = ul.root;
+        auto it = subst.find(r);
+        if (it == subst.end() && !ul.head) {
+          // Root unchanged and no writes: only the index may have changed.
+          result = ReadExpr::create(ul, kids[0]);
+        } else {
+          const Array *newRoot = (it != subst.end()) ? it->second : r;
+          // ul.head is newest; replay oldest-first so head stays newest.
+          std::vector<ref<UpdateNode>> nodes;
+          for (ref<UpdateNode> un = ul.head; un; un = un->next)
+            nodes.push_back(un);
+          UpdateList newUL(newRoot, nullptr);
+          for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit)
+            newUL.extend(resolvedChild((*rit)->index, memo),
+                         resolvedChild((*rit)->value, memo));
+          result = ReadExpr::create(newUL, kids[0]);
+        }
+      } else {
+        result = rebuildWithKids(f.e, kids);
+      }
+      memo.emplace(k, result);
     }
-  } else if (isCommutativeKind(e->getKind())) {
-    ref<Expr> tmp = rebuildWithKids(e, kids);
-    result = flattenAndRebuildAssoc(tmp);
-  } else {
-    result = rebuildWithKids(e, kids);
   }
 
-  memo.emplace(e.get(), result);
-  return result;
+  if (root.isNull() || root->getNumKids() == 0)
+    return root;
+  return memo.at(root.get());
 }
+
+// Iterative post-order tree canonicalisation. Memoised on the original Expr*
+// (sound: canonicalisation is a pure function of node structure). Sorts
+// commutative children and rebuilds associative chains into a balanced shape;
+// also canonicalises read update-list index/value subtrees.
+ref<Expr>
+canonicalizeExprTreeMemo(const ref<Expr> &root,
+                         std::unordered_map<const Expr *, ref<Expr>> &memo) {
+  struct Frame {
+    ref<Expr> e;
+    bool resolve;
+  };
+  std::vector<Frame> stack;
+  stack.push_back({root, false});
+
+  while (!stack.empty()) {
+    Frame f = stack.back();
+    stack.pop_back();
+    if (f.e.isNull() || f.e->getNumKids() == 0)
+      continue;
+    const Expr *k = f.e.get();
+
+    if (!f.resolve) {
+      if (memo.count(k))
+        continue;
+      stack.push_back({f.e, true});
+      unsigned n = f.e->getNumKids();
+      for (unsigned i = 0; i < n; ++i)
+        stack.push_back({f.e->getKid(i), false});
+      if (f.e->getKind() == Expr::Read) {
+        const ReadExpr *re = cast<ReadExpr>(k);
+        for (ref<UpdateNode> un = re->updates.head; un; un = un->next) {
+          stack.push_back({un->index, false});
+          stack.push_back({un->value, false});
+        }
+      }
+    } else {
+      if (memo.count(k))
+        continue;
+      unsigned n = f.e->getNumKids();
+      std::vector<ref<Expr>> kids;
+      kids.reserve(n);
+      for (unsigned i = 0; i < n; ++i)
+        kids.push_back(resolvedChild(f.e->getKid(i), memo));
+
+      ref<Expr> result;
+      if (f.e->getKind() == Expr::Read) {
+        const ReadExpr *re = cast<ReadExpr>(k);
+        const UpdateList &ul = re->updates;
+        if (!ul.head) {
+          result = ReadExpr::create(ul, kids[0]);
+        } else {
+          std::vector<ref<UpdateNode>> nodes;
+          for (ref<UpdateNode> un = ul.head; un; un = un->next)
+            nodes.push_back(un);
+          UpdateList newUL(ul.root, nullptr);
+          // extend() prepends; replay oldest-first to preserve head=newest.
+          for (auto rit = nodes.rbegin(); rit != nodes.rend(); ++rit)
+            newUL.extend(resolvedChild((*rit)->index, memo),
+                         resolvedChild((*rit)->value, memo));
+          result = ReadExpr::create(newUL, kids[0]);
+        }
+      } else if (isCommutativeKind(f.e->getKind())) {
+        ref<Expr> tmp = rebuildWithKids(f.e, kids);
+        result = flattenAndRebuildAssoc(tmp);
+      } else {
+        result = rebuildWithKids(f.e, kids);
+      }
+      memo.emplace(k, result);
+    }
+  }
+
+  if (root.isNull() || root->getNumKids() == 0)
+    return root;
+  return memo.at(root.get());
+}
+
+} // anonymous namespace
 
 namespace klee {
 
 ref<Expr> canonicalizeExprTree(ref<Expr> e) {
   std::unordered_map<const Expr *, ref<Expr>> memo;
   return canonicalizeExprTreeMemo(e, memo);
+}
+
+std::vector<ref<Expr>>
+canonicalizeExprTreesOnly(const std::vector<ref<Expr>> &constraints) {
+  std::vector<ref<Expr>> out = constraints;
+  // Constraints share sub-DAGs, so canonicalize them under one memo to keep the
+  // work linear in distinct subexpressions. Arrays are deliberately not renamed
+  // (see header): every ReadExpr keeps its original Array root, so a cached
+  // Assignment remains usable and findSymbolicObjects recovers the same objects.
+  std::unordered_map<const Expr *, ref<Expr>> treeMemo;
+  for (auto &e : out)
+    e = canonicalizeExprTreeMemo(e, treeMemo);
+  return out;
 }
 
 CanonicalizationResult
@@ -362,9 +556,9 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
 
   std::unordered_map<const Array *, unsigned> order;
   unsigned nextIndex = 0;
-  ArrayOrderCollector collector(order, nextIndex);
+  std::unordered_set<const Expr *> visited;
   for (auto &e : res.constraints)
-    collector.visit(e);
+    collectArrayOrder(e, order, nextIndex, visited);
 
   for (auto &kv : order) {
     const Array *orig = kv.first;
@@ -387,9 +581,9 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
     res.inverseArrayMap[canon] = orig;
   }
 
-  ArraySubstitutionVisitor subst(res.forwardArrayMap);
+  std::unordered_map<const Expr *, ref<Expr>> substMemo;
   for (auto &e : res.constraints)
-    e = subst.visit(e);
+    e = substituteArrays(e, res.forwardArrayMap, substMemo);
 
   // Shared memo: constraints share sub-DAGs after substitution.
   std::unordered_map<const Expr *, ref<Expr>> treeMemo;
