@@ -4,10 +4,33 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace klee;
 using mapofsets::DiskMapOfSets;
+
+namespace {
+// W6 ablation probe: when KLEE_DISK_CEX_ABLATE is set, classify every disk
+// lookup on the SAME query stream as a single trie run, so the trie-vs-flat
+// comparison is free of cross-run exploration drift. trieHit is the actual
+// result; flatHit is whether an exact-key (flat-hash) match would have been
+// usable; trieOnly = hits the subset/superset trie provides that a flat hash
+// structurally cannot.
+struct CexAblationProbe {
+  bool on;
+  unsigned long lookups = 0, trieHit = 0, flatHit = 0, trieOnly = 0;
+  CexAblationProbe() : on(getenv("KLEE_DISK_CEX_ABLATE") != nullptr) {}
+  ~CexAblationProbe() {
+    if (on)
+      fprintf(stderr,
+              "CEX_ABLATE lookups=%lu trieHit=%lu flatHit=%lu trieOnly=%lu\n",
+              lookups, trieHit, flatHit, trieOnly);
+  }
+};
+CexAblationProbe g_ablate;
+} // namespace
 
 DiskCexCache::DiskCexCache(const std::string &filename,
                            const CacheMetadata &current,
@@ -175,13 +198,55 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
     return false;
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
   auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, arrayCache_);
+
+  // W6 ablation: KLEE_DISK_CEX_FLAT emulates a flat canonical-key->result hash
+  // map by matching on the exact key only (no subset/superset trie traversal).
+  // Running cat warm with and without this isolates what the trie buys.
+  static const bool flatMode = getenv("KLEE_DISK_CEX_FLAT") != nullptr;
+  if (flatMode) {
+    auto exact = disk_.lookup(diskKey);
+    if (!exact)
+      return false;
+    std::vector<std::string> v{*exact};
+    return pickEntry(v, canon, constraints, /*unsatValid=*/true, outAssignment);
+  }
+
+  bool trieResult = false;
   if (trySuperset) {
     auto supers = disk_.supersets(diskKey);
     if (pickEntry(supers, canon, constraints, /*unsatValid=*/false, outAssignment))
-      return true;
+      trieResult = true;
   }
-  auto subs = disk_.subsets(diskKey);
-  return pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
+  if (!trieResult) {
+    auto subs = disk_.subsets(diskKey);
+    trieResult = pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
+  }
+
+  if (g_ablate.on) {
+    // Would a flat exact-key hash have produced a usable hit on THIS query?
+    auto flatUsable = [&]() -> bool {
+      auto exact = disk_.lookup(diskKey);
+      if (!exact)
+        return false;
+      ParsedValue pv = parseValue(*exact);
+      if (pv.kind == ValueKind::Unsat)
+        return true; // exact key: live set == stored set, UNSAT is valid
+      if (pv.kind == ValueKind::AssignmentData) {
+        std::map<std::string, const Array *> nameToOrig;
+        for (const auto &[orig, can] : canon.forwardArrayMap)
+          nameToOrig[can->name] = orig;
+        auto a = parseAssignmentData(pv.satData, nameToOrig);
+        return a && a->satisfies(constraints.begin(), constraints.end());
+      }
+      return false;
+    };
+    bool flat = flatUsable();
+    ++g_ablate.lookups;
+    if (trieResult)          ++g_ablate.trieHit;
+    if (flat)                ++g_ablate.flatHit;
+    if (trieResult && !flat) ++g_ablate.trieOnly;
+  }
+  return trieResult;
 }
 
 bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,

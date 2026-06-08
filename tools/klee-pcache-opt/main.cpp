@@ -907,5 +907,5 @@ int main(int argc, char **argv) {
   MapOfSetsDiskBuilder::build(result, outputPath, meta, chunkSize);
 
   fprintf(stdout, "\nWritten to   : %s\n", outputPath.c_str());
-  return conflicts.empty() ? 0 : 2;
+  return conflicts.empty() ? 0 : 2;  
 }
