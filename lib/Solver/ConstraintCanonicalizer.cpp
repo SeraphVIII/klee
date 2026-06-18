@@ -119,7 +119,7 @@ int updateListLenCmp(const ref<Expr> &a, const ref<Expr> &b) {
 // Iterative three-way compare matching ExprCanonicalOrder. Memoised on (a,b)
 // pairs (shared DAGs would otherwise be exponential). Returns <0 / 0 / >0.
 int compareExpr(const ref<Expr> &a0, const ref<Expr> &b0,
-                std::map<std::pair<const Expr *, const Expr *>, int> &memo) {
+                klee::detail::ExprCompareMemo &memo) {
   struct Frame {
     ref<Expr> a, b;
     bool resolve;
@@ -179,8 +179,26 @@ int compareExpr(const ref<Expr> &a0, const ref<Expr> &b0,
 
 bool klee::ExprCanonicalOrder::operator()(const ref<Expr> &a,
                                           const ref<Expr> &b) const {
-  std::map<std::pair<const Expr *, const Expr *>, int> memo;
-  return compareExpr(a, b, memo) < 0;
+  // Fast path: order by the expression's cached structural hash. Expr::hash()
+  // is computed once at construction and is O(1); it is pointer-independent
+  // (Array hashes from the canonical name + size, Expr from kind + child
+  // hashes, Constant from value + width), so the order is deterministic and
+  // cross-run stable for the canonicalised (post-alpha-rename) expressions.
+  // This replaces the O(depth) structural walk that dominated the commutative
+  // operand sort on deeply nested formulas (the printf per-hit cost) with a
+  // single integer compare.
+  unsigned ha = a->hash(), hb = b->hash();
+  if (ha != hb)
+    return ha < hb;
+  if (a.get() == b.get())
+    return false; // same node: equal, and no memo needed
+  // Hash collision (~1 in 2^32) OR distinct structurally-equal operands: fall
+  // back to the authoritative structural comparison so the order stays a total,
+  // deterministic order. Allocate the memo lazily — the common (distinct-hash)
+  // path never reaches here.
+  if (!memo_)
+    memo_ = std::make_shared<detail::ExprCompareMemo>();
+  return compareExpr(a, b, *memo_) < 0;
 }
 
 namespace {
@@ -369,12 +387,23 @@ resolvedChild(const ref<Expr> &x,
   return memo.at(x.get());
 }
 
-// Iterative post-order rewrite of every ReadExpr onto its canonical array,
-// walking UpdateList chains so symbolic writes are substituted too. Pure
-// structural rewrite, so traversal order does not affect the output.
-ref<Expr> substituteArrays(const ref<Expr> &root,
-                           const std::map<const Array *, const Array *> &subst,
-                           std::unordered_map<const Expr *, ref<Expr>> &memo) {
+// Fused iterative post-order pass that BOTH rewrites every ReadExpr onto its
+// canonical array AND canonicalises commutative/associative operand ordering,
+// in a single tree reconstruction. Previously these were two separate passes
+// (substituteArrays then canonicalizeExprTreeMemo); the intermediate tree was
+// fully allocated and immediately discarded. Fusing halves Expr::create churn
+// on deep formulas (audit F2). When `doTreeCanon` is false the pass degrades to
+// substitution only (the KLEE_DISK_CEX_NO_TREE_CANON ablation).
+//
+// Equivalent to the old two-pass composition: at each node the kids are already
+// substituted+canonicalised (post-order), so rebuilding the node with them and
+// then sorting commutative operands reproduces exactly what pass 2 saw after
+// pass 1. Memoised on the ORIGINAL Expr* — sound because the result is a pure
+// function of the original node (subst is fixed; children resolve recursively).
+ref<Expr> substituteAndCanonicalize(
+    const ref<Expr> &root,
+    const std::unordered_map<const Array *, const Array *> &subst,
+    std::unordered_map<const Expr *, ref<Expr>> &memo, bool doTreeCanon) {
   struct Frame {
     ref<Expr> e;
     bool resolve;
@@ -409,8 +438,13 @@ ref<Expr> substituteArrays(const ref<Expr> &root,
       unsigned n = f.e->getNumKids();
       std::vector<ref<Expr>> kids;
       kids.reserve(n);
-      for (unsigned i = 0; i < n; ++i)
-        kids.push_back(resolvedChild(f.e->getKid(i), memo));
+      bool kidsChanged = false;
+      for (unsigned i = 0; i < n; ++i) {
+        ref<Expr> rc = resolvedChild(f.e->getKid(i), memo);
+        if (rc.get() != f.e->getKid(i).get())
+          kidsChanged = true;
+        kids.push_back(std::move(rc));
+      }
 
       ref<Expr> result;
       if (f.e->getKind() == Expr::Read) {
@@ -418,12 +452,17 @@ ref<Expr> substituteArrays(const ref<Expr> &root,
         const UpdateList &ul = re->updates;
         const Array *r = ul.root;
         auto it = subst.find(r);
-        if (it == subst.end() && !ul.head) {
-          // Root unchanged and no writes: only the index may have changed.
-          result = ReadExpr::create(ul, kids[0]);
+        const Array *newRoot = (it != subst.end()) ? it->second : r;
+        if (!ul.head) {
+          // No writes: only the root array and/or index may differ.
+          if (newRoot == r && !kidsChanged)
+            result = f.e; // unchanged subtree: reuse it (audit F3)
+          else
+            result = ReadExpr::create(UpdateList(newRoot, nullptr), kids[0]);
         } else {
-          const Array *newRoot = (it != subst.end()) ? it->second : r;
-          // ul.head is newest; replay oldest-first so head stays newest.
+          // ul.head is newest; replay oldest-first so head stays newest. The
+          // update index/value subtrees use their resolved (substituted +
+          // canonicalised) forms.
           std::vector<ref<UpdateNode>> nodes;
           for (ref<UpdateNode> un = ul.head; un; un = un->next)
             nodes.push_back(un);
@@ -433,6 +472,11 @@ ref<Expr> substituteArrays(const ref<Expr> &root,
                          resolvedChild((*rit)->value, memo));
           result = ReadExpr::create(newUL, kids[0]);
         }
+      } else if (doTreeCanon && isCommutativeKind(f.e->getKind())) {
+        ref<Expr> tmp = rebuildWithKids(f.e, kids);
+        result = flattenAndRebuildAssoc(tmp);
+      } else if (!kidsChanged) {
+        result = f.e; // unchanged, non-reordered subtree: reuse it (audit F3)
       } else {
         result = rebuildWithKids(f.e, kids);
       }
@@ -544,15 +588,17 @@ canonicalizeExprTreesOnly(const std::vector<ref<Expr>> &constraints) {
 }
 
 CanonicalizationResult
-canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
+canonicalizeConstraintSet(std::vector<ref<Expr>> constraints,
                           ArrayCache &arrayCache) {
   CanonicalizationResult res;
-  res.constraints = constraints;
+  res.constraints = std::move(constraints);
 
-  ExprCanonicalOrder cmp;
   // Sort first so the DFS encounter order — which drives canonical name
-  // assignment — is itself pointer-independent.
-  std::sort(res.constraints.begin(), res.constraints.end(), cmp);
+  // assignment — is itself pointer-independent. A fresh comparator per sort:
+  // its memo keys are raw Expr* and are only valid while nothing in the sorted
+  // range is freed (substitution below allocates/frees a new generation).
+  std::sort(res.constraints.begin(), res.constraints.end(),
+            ExprCanonicalOrder{});
 
   std::unordered_map<const Array *, unsigned> order;
   unsigned nextIndex = 0;
@@ -565,51 +611,75 @@ canonicalizeConstraintSet(const std::vector<ref<Expr>> &constraints,
     unsigned pos = kv.second;
     std::string canonName = "A" + llvm::utostr(pos);
 
-    const ref<ConstantExpr> *cbegin = nullptr;
-    const ref<ConstantExpr> *cend   = nullptr;
-    if (!orig->constantValues.empty()) {
-      cbegin = &orig->constantValues[0];
-      cend   = cbegin + orig->constantValues.size();
-    }
-
+    // Always mint the canonical array as SYMBOLIC, even when the original is
+    // concrete (audit P3). The canonical key prints a read by its array *name*
+    // only — the constant bytes never reach the key — and a read on a concrete
+    // array that survives to canonicalisation necessarily has a symbolic index
+    // (a constant index would already have folded the read to a scalar), so
+    // ReadExpr::create does not fold regardless of array constness: the key is
+    // byte-identical either way. Dropping the values lets ArrayCache dedup
+    // same-shape canonical arrays (it never caches *constant* arrays — one
+    // distinct, never-freed allocation per concrete array per lookup otherwise),
+    // bounding memory and removing a per-lookup byte copy. Concrete contents
+    // needed by the write path are read from the ORIGINAL array instead.
     const Array *canon =
         arrayCache.CreateArray(canonName, orig->size,
-                               cbegin, cend,
+                               /*constantValuesBegin=*/nullptr,
+                               /*constantValuesEnd=*/nullptr,
                                orig->domain, orig->range);
 
     res.forwardArrayMap[orig] = canon;
     res.inverseArrayMap[canon] = orig;
+    // pos < 256 in practice (serialisation caps at 255 arrays); carry it so the
+    // disk/log writers read the index directly rather than re-parsing the name.
+    if (pos <= 255)
+      res.canonIndex[canon] = static_cast<std::uint8_t>(pos);
   }
 
-  std::unordered_map<const Expr *, ref<Expr>> substMemo;
-  for (auto &e : res.constraints)
-    e = substituteArrays(e, res.forwardArrayMap, substMemo);
+  // ABLATION (KLEE_DISK_CEX_NO_TREE_CANON): skip expression-tree canonicalisation
+  // (commutative/associative flatten+rebuild) — the per-lookup-expensive step on
+  // deeply nested expressions — while keeping alpha-renaming so disk keys and
+  // value encoding still work. Sound: a less-canonical key only loses hits
+  // (commutative/associative variants stop matching), never produces wrong hits.
+  static const bool skipTreeCanon =
+      getenv("KLEE_DISK_CEX_NO_TREE_CANON") != nullptr;
 
-  // Shared memo: constraints share sub-DAGs after substitution.
-  std::unordered_map<const Expr *, ref<Expr>> treeMemo;
+  // Single fused pass: substitute canonical arrays AND canonicalise the tree.
+  // Shared memo: constraints share sub-DAGs, so distinct subexpressions are
+  // rebuilt once.
+  std::unordered_map<const Expr *, ref<Expr>> memo;
   for (auto &e : res.constraints)
-    e = canonicalizeExprTreeMemo(e, treeMemo);
+    e = substituteAndCanonicalize(e, res.forwardArrayMap, memo,
+                                  /*doTreeCanon=*/!skipTreeCanon);
 
   // Renaming and tree canonicalization can perturb the relative order; re-sort.
-  std::sort(res.constraints.begin(), res.constraints.end(), cmp);
+  std::sort(res.constraints.begin(), res.constraints.end(),
+            ExprCanonicalOrder{});
 
   return res;
 }
 
-std::pair<std::set<std::string>, CanonicalizationResult>
-buildConstraintDiskKey(const std::vector<ref<Expr>> &constraints,
+std::pair<std::vector<std::string>, CanonicalizationResult>
+buildConstraintDiskKey(std::vector<ref<Expr>> constraints,
                        ArrayCache &arrayCache) {
   CanonicalizationResult canon =
-      canonicalizeConstraintSet(constraints, arrayCache);
+      canonicalizeConstraintSet(std::move(constraints), arrayCache);
 
-  std::set<std::string> key;
+  std::vector<std::string> key;
+  key.reserve(canon.constraints.size());
   for (const auto &e : canon.constraints) {
     std::string s;
     llvm::raw_string_ostream os(s);
     ExprPPrinter::printSingleExpr(os, e);
     os.flush();
-    key.insert(s);
+    key.push_back(std::move(s));
   }
+  // The disk trie requires a sorted set of distinct key strings. Build it as a
+  // vector + sort + unique (one allocation) instead of a std::set (one RB-tree
+  // node per element) — audit O4. Equivalent: distinct constraints that print
+  // to the same canonical string collapse, exactly as the set deduplicated.
+  std::sort(key.begin(), key.end());
+  key.erase(std::unique(key.begin(), key.end()), key.end());
   return {std::move(key), std::move(canon)};
 }
 

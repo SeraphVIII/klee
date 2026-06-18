@@ -482,7 +482,7 @@ TEST(DiskCexCacheTest, AssignmentRoundTrip) {
   Assignment assignment(objs, vals);
 
   std::string serialized =
-      DiskCexCache::serializeAssignment(&assignment, canon.forwardArrayMap);
+      DiskCexCache::serializeAssignment(&assignment, canon);
 
   // Sanity-check the v2 binary format: [0x01][n=1][idx=0][len=4][42,0,0,0]
   ASSERT_GE(serialized.size(), 8u) << "Serialized value too short";
@@ -592,7 +592,7 @@ TEST(DiskCexCacheTest, WriteCacheRoundTrip) {
 
     std::string value = assignment
                             ? DiskCexCache::serializeAssignment(
-                                  assignment, canon.forwardArrayMap)
+                                  assignment, canon)
                             : ""; // empty = UNSAT sentinel in v2 binary format
     diskTree.insert(diskKey, value);
   }
@@ -668,7 +668,7 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
         ExprPPrinter::printSingleExpr(os, e); os.flush();
         diskKey.insert(s);
       }
-      std::string val = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
+      std::string val = a ? DiskCexCache::serializeAssignment(a, canon)
                           : ""; // empty = UNSAT sentinel in v2 binary format
       tree.insert(diskKey, val);
     };
@@ -722,7 +722,7 @@ TEST(DiskCexCacheTest, MergeRoundTrip) {
       std::vector<std::vector<unsigned char>> zVals = {{42,0,0,0}};
       Assignment satZ(zObjs, zVals);
       tree.insert(diskKey,
-                  DiskCexCache::serializeAssignment(&satZ, canon.forwardArrayMap));
+                  DiskCexCache::serializeAssignment(&satZ, canon));
     }
     MapOfSetsDiskBuilder::build(tree, gen2File);
   }
@@ -1004,7 +1004,7 @@ TEST(DiskCexCacheTest, ResizesWitnessToLiveArraySize) {
   std::vector<std::vector<unsigned char>> vals = {bigBytes};
   Assignment a(objs, vals);
   std::string value =
-      DiskCexCache::serializeAssignment(&a, canon.forwardArrayMap);
+      DiskCexCache::serializeAssignment(&a, canon);
 
   klee::MapOfSets<std::string, std::string> mem;
   mem.insert(diskKey, value);

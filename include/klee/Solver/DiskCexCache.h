@@ -12,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace klee {
@@ -20,10 +21,11 @@ namespace klee {
 class DiskCexCache {
 public:
   /// Serialize a SAT assignment to the binary v2 disk format.
-  /// forwardArrayMap maps original Array* -> canonical Array* (A0, A1, ...).
+  /// `canon` supplies forwardArrayMap (original Array* -> canonical A0,A1,...)
+  /// and canonIndex (canonical Array* -> its integer index), read directly
+  /// rather than re-parsed out of the canonical array name.
   static std::string
-  serializeAssignment(const Assignment *a,
-                      const std::map<const Array *, const Array *> &forwardArrayMap);
+  serializeAssignment(const Assignment *a, const CanonicalizationResult &canon);
 
   /// `current` describes the running KLEE; metadata mismatch is non-fatal
   /// (warns only — SAT is re-verified, UNSAT is solver-agnostic).
@@ -55,7 +57,9 @@ private:
 
   struct ParsedValue {
     ValueKind kind;
-    std::string satData;
+    // View into the caller's value string (which outlives this struct's use);
+    // avoids copying the witness blob out of the trie result (audit O3).
+    std::string_view satData;
   };
 
   ParsedValue parseValue(const std::string &val) const;
@@ -63,13 +67,15 @@ private:
   // Caller chooses ownership: retain by moving into ownedAssignments_, else
   // the unique_ptr dies at end of scope. pickEntry retains only on a hit.
   std::unique_ptr<Assignment> parseAssignmentData(
-      const std::string &data,
+      std::string_view data,
       const std::map<std::string, const Array *> &nameToOrig);
 
   // unsatValid is true for subset queries (UNSAT subset ⇒ UNSAT) and false
   // for superset queries (UNSAT superset says nothing about the subset).
+  // nameToOrig (canonical name -> original Array*) is built once per find() by
+  // the caller and shared across the up-to-two pickEntry calls (audit F7).
   bool pickEntry(const std::vector<std::string> &values,
-                 const CanonicalizationResult &canon,
+                 const std::map<std::string, const Array *> &nameToOrig,
                  const std::set<ref<Expr>> &originalConstraints,
                  bool unsatValid,
                  Assignment *&outAssignment);

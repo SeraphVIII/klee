@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
-#include <map>
-#include <set>
+#include <unordered_map>
+#include <unordered_set>
 
 // Multi-byte integers are written via raw memcpy; LE-only until routed
 // through explicit byte-order helpers.
@@ -45,14 +45,19 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   dfsAssign(&tree.root, nodes);
   uint32_t totalNodes = static_cast<uint32_t>(nodes.size());
 
-  std::set<std::string> uniqueKeys;
+  // Collect distinct keys with O(1) inserts, then sort into the string table.
+  // The table MUST stay sorted: the reader binary-searches children by key and
+  // relies on key_index numeric order matching string order (audit N1/F6).
+  std::unordered_set<std::string> uniqueKeys;
   for (const auto &bn : nodes)
     for (const auto &kv : bn.children)
       uniqueKeys.insert(kv.first);
 
   std::vector<std::string> strings(uniqueKeys.begin(), uniqueKeys.end());
+  std::sort(strings.begin(), strings.end());
 
-  std::map<std::string, uint32_t> stringIndex;
+  std::unordered_map<std::string, uint32_t> stringIndex;
+  stringIndex.reserve(strings.size() * 2);
   for (uint32_t i = 0; i < static_cast<uint32_t>(strings.size()); ++i)
     stringIndex[strings[i]] = i;
 
@@ -114,7 +119,16 @@ void MapOfSetsDiskBuilder::build(const UBTree &tree,
   // v2: canonicalizer DFS walks converted from recursion to explicit-stack
   // iteration (deep KLEE expressions overflowed the C++ stack); the traversal
   // change can perturb canonical key bytes, so v1 caches must not be reused.
-  static constexpr uint32_t kCanonVersion = 2;
+  // v3: ExprCanonicalOrder now orders by cached structural hash (with a
+  // structural tiebreak on collision) instead of a pure structural walk; this
+  // changes commutative operand order and thus the canonical key bytes.
+  // CAVEAT: as of v3 the canonical operand order depends on Expr::computeHash().
+  // That is deterministic within a build (so cold/warm match), but if KLEE's
+  // expression hashing ever changes the canonical key bytes shift silently.
+  // The failure mode is benign (old caches all-miss, never a wrong hit — the
+  // key strings simply differ), but BUMP THIS VERSION if computeHash changes so
+  // the mismatch is reported instead of degrading to silent misses.
+  static constexpr uint32_t kCanonVersion = 3;
   hdr->set_canonicalization_version(kCanonVersion);
   if (!metadata.solverBackend.empty())
     hdr->set_solver_backend(metadata.solverBackend);

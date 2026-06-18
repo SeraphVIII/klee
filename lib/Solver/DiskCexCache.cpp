@@ -60,8 +60,8 @@ DiskCexCache::DiskCexCache(const std::string &filename,
 // SAT v2: [u8 0x01][u8 n_arrays]([u8 idx][u32 len LE][bytes])×n
 // UNSAT:  empty string
 std::string DiskCexCache::serializeAssignment(
-    const Assignment *a,
-    const std::map<const Array *, const Array *> &forwardArrayMap) {
+    const Assignment *a, const CanonicalizationResult &canon) {
+  const auto &forwardArrayMap = canon.forwardArrayMap;
   // Returning "" aliases the UNSAT sentinel, so production callers must
   // pre-check; soft-fail here is defence in depth against direct callers.
   if (forwardArrayMap.size() > 255) {
@@ -76,8 +76,12 @@ std::string DiskCexCache::serializeAssignment(
   std::vector<Entry> entries;
   entries.reserve(forwardArrayMap.size());
 
-  for (const auto &[orig, canon] : forwardArrayMap) {
-    uint8_t idx = static_cast<uint8_t>(std::stoi(canon->name.substr(1)));
+  for (const auto &[orig, canonArr] : forwardArrayMap) {
+    // Index carried alongside the canonical array — no name re-parse (audit F8).
+    auto ci = canon.canonIndex.find(canonArr);
+    uint8_t idx = (ci != canon.canonIndex.end())
+                      ? ci->second
+                      : static_cast<uint8_t>(std::stoi(canonArr->name.substr(1)));
     auto it = a->bindings.find(orig);
     // An unbound array gets data_len=0; distinct from UNSAT (whole record empty).
     static const std::vector<unsigned char> empty;
@@ -101,30 +105,30 @@ std::string DiskCexCache::serializeAssignment(
 DiskCexCache::ParsedValue
 DiskCexCache::parseValue(const std::string &val) const {
   if (val.empty())
-    return {ValueKind::Unsat, ""};
+    return {ValueKind::Unsat, {}};
   if (static_cast<unsigned char>(val[0]) == 0x01)
-    return {ValueKind::AssignmentData, val};
-  return {ValueKind::Unknown, ""};
+    return {ValueKind::AssignmentData, std::string_view(val)};
+  return {ValueKind::Unknown, {}};
 }
 
 std::unique_ptr<Assignment>
 DiskCexCache::parseAssignmentData(
-    const std::string &data,
+    std::string_view data,
     const std::map<std::string, const Array *> &nameToOrig) {
   if (data.size() < 2) return nullptr;
   uint8_t n_arrays = static_cast<uint8_t>(data[1]);
 
-  std::vector<const Array *> objects;
-  std::vector<std::vector<unsigned char>> values;
-  objects.reserve(n_arrays);
-  values.reserve(n_arrays);
+  // Build the Assignment's bindings directly, moving each witness in, instead
+  // of staging objects/values vectors that the Assignment constructor then
+  // copies — eliminates the intermediate vectors and a per-array copy (O2).
+  auto assignment = std::make_unique<Assignment>(/*allowFreeValues=*/false);
 
   size_t pos = 2;
   for (uint8_t i = 0; i < n_arrays; ++i) {
     if (pos + 5 > data.size()) return nullptr;
     uint8_t name_index = static_cast<uint8_t>(data[pos++]);
     uint32_t data_len = 0;
-    memcpy(&data_len, &data[pos], 4); pos += 4;
+    memcpy(&data_len, data.data() + pos, 4); pos += 4;
     if (pos + data_len > data.size()) return nullptr;
 
     std::string name = "A" + std::to_string(name_index);
@@ -136,30 +140,25 @@ DiskCexCache::parseAssignmentData(
       // exact-sized witness is required or IndependentSolver asserts.
       const Array *orig = nameIt->second;
       const unsigned char *src =
-          reinterpret_cast<const unsigned char *>(&data[pos]);
+          reinterpret_cast<const unsigned char *>(data.data() + pos);
       std::vector<unsigned char> witness(orig->size, 0);
       std::memcpy(witness.data(), src,
                   std::min<size_t>(data_len, orig->size));
-      objects.push_back(orig);
-      values.push_back(std::move(witness));
+      assignment->bindings.emplace(orig, std::move(witness));
     }
     pos += data_len;
   }
   if (pos != data.size()) return nullptr;
 
-  return std::make_unique<Assignment>(objects, values);
+  return assignment;
 }
 
 bool DiskCexCache::pickEntry(
     const std::vector<std::string> &values,
-    const CanonicalizationResult &canon,
+    const std::map<std::string, const Array *> &nameToOrig,
     const std::set<ref<Expr>> &originalConstraints,
     bool unsatValid,
     Assignment *&outAssignment) {
-  std::map<std::string, const Array *> nameToOrig;
-  for (const auto &[orig, can] : canon.forwardArrayMap)
-    nameToOrig[can->name] = orig;
-
   for (const auto &val : values) {
     ParsedValue pv = parseValue(val);
     switch (pv.kind) {
@@ -197,7 +196,13 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
   if (!disk_.isValid())
     return false;
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, arrayCache_);
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(std::move(vec), arrayCache_);
+
+  // Built once and shared across the up-to-two pickEntry calls below and the
+  // ablation probe (audit F7).
+  std::map<std::string, const Array *> nameToOrig;
+  for (const auto &[orig, can] : canon.forwardArrayMap)
+    nameToOrig[can->name] = orig;
 
   // W6 ablation: KLEE_DISK_CEX_FLAT emulates a flat canonical-key->result hash
   // map by matching on the exact key only (no subset/superset trie traversal).
@@ -208,18 +213,18 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
     if (!exact)
       return false;
     std::vector<std::string> v{*exact};
-    return pickEntry(v, canon, constraints, /*unsatValid=*/true, outAssignment);
+    return pickEntry(v, nameToOrig, constraints, /*unsatValid=*/true, outAssignment);
   }
 
   bool trieResult = false;
   if (trySuperset) {
     auto supers = disk_.supersets(diskKey);
-    if (pickEntry(supers, canon, constraints, /*unsatValid=*/false, outAssignment))
+    if (pickEntry(supers, nameToOrig, constraints, /*unsatValid=*/false, outAssignment))
       trieResult = true;
   }
   if (!trieResult) {
     auto subs = disk_.subsets(diskKey);
-    trieResult = pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
+    trieResult = pickEntry(subs, nameToOrig, constraints, /*unsatValid=*/true, outAssignment);
   }
 
   if (g_ablate.on) {
@@ -232,9 +237,6 @@ bool DiskCexCache::find(const std::set<ref<Expr>> &constraints,
       if (pv.kind == ValueKind::Unsat)
         return true; // exact key: live set == stored set, UNSAT is valid
       if (pv.kind == ValueKind::AssignmentData) {
-        std::map<std::string, const Array *> nameToOrig;
-        for (const auto &[orig, can] : canon.forwardArrayMap)
-          nameToOrig[can->name] = orig;
         auto a = parseAssignmentData(pv.satData, nameToOrig);
         return a && a->satisfies(constraints.begin(), constraints.end());
       }
@@ -254,9 +256,12 @@ bool DiskCexCache::findSuperset(const std::set<ref<Expr>> &constraints,
   if (!disk_.isValid())
     return false;
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, arrayCache_);
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(std::move(vec), arrayCache_);
+  std::map<std::string, const Array *> nameToOrig;
+  for (const auto &[orig, can] : canon.forwardArrayMap)
+    nameToOrig[can->name] = orig;
   auto supers = disk_.supersets(diskKey);
-  return pickEntry(supers, canon, constraints, /*unsatValid=*/false, outAssignment);
+  return pickEntry(supers, nameToOrig, constraints, /*unsatValid=*/false, outAssignment);
 }
 
 bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
@@ -264,7 +269,10 @@ bool DiskCexCache::findSubset(const std::set<ref<Expr>> &constraints,
   if (!disk_.isValid())
     return false;
   std::vector<ref<Expr>> vec(constraints.begin(), constraints.end());
-  auto [diskKey, canon] = klee::buildConstraintDiskKey(vec, arrayCache_);
+  auto [diskKey, canon] = klee::buildConstraintDiskKey(std::move(vec), arrayCache_);
+  std::map<std::string, const Array *> nameToOrig;
+  for (const auto &[orig, can] : canon.forwardArrayMap)
+    nameToOrig[can->name] = orig;
   auto subs = disk_.subsets(diskKey);
-  return pickEntry(subs, canon, constraints, /*unsatValid=*/true, outAssignment);
+  return pickEntry(subs, nameToOrig, constraints, /*unsatValid=*/true, outAssignment);
 }

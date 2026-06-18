@@ -78,8 +78,8 @@ DiskMapOfSets::DiskMapOfSets(const std::string &filename, size_t max_cache_size)
 
   // Stale-key files (older canonicalization) must be rebuilt rather than
   // silently producing all misses. Keep in lockstep with kCanonVersion in
-  // MapOfSetsDiskBuilder.cpp (v2: iterative canonicalizer traversal).
-  static constexpr uint32_t kExpectedCanonVersion = 2;
+  // MapOfSetsDiskBuilder.cpp (v3: hash-ordered canonical operand sort).
+  static constexpr uint32_t kExpectedCanonVersion = 3;
   uint32_t canon_version = header_file_.header().canonicalization_version();
   if (canon_version != kExpectedCanonVersion) {
     fail("DiskMapOfSets: canonicalization version mismatch (delete and re-run) in");
@@ -245,16 +245,39 @@ std::string DiskMapOfSets::read_value(uint64_t offset) const {
   return std::string(blob + 4, len);
 }
 
+std::vector<uint32_t>
+DiskMapOfSets::resolveQueryIndices(const std::vector<std::string> &query_set,
+                                   bool &allPresent) const {
+  allPresent = true;
+  std::vector<uint32_t> indices;
+  indices.reserve(query_set.size());
+  // string_table_ is sorted ascending (the builder sorts it). query_set is a
+  // sorted vector (the canonical key is sorted), so iterating it yields indices
+  // in ascending order without an extra sort.
+  for (const auto &s : query_set) {
+    auto it = std::lower_bound(string_table_.begin(), string_table_.end(), s);
+    if (it != string_table_.end() && *it == s)
+      indices.push_back(static_cast<uint32_t>(it - string_table_.begin()));
+    else
+      allPresent = false;
+  }
+  return indices;
+}
+
 std::optional<std::string>
-DiskMapOfSets::lookup(const std::set<std::string> &query_set) {
+DiskMapOfSets::lookup(const std::vector<std::string> &query_set) {
   if (!valid_) return std::nullopt;
+  bool allPresent = false;
+  std::vector<uint32_t> q = resolveQueryIndices(query_set, allPresent);
+  // Exact lookup needs every query element to match a child; a string absent
+  // from the table can never match, so the whole lookup misses.
+  if (!allPresent) return std::nullopt;
   return lookup_rec(header_file_.header().root_id(),
-                    query_set.begin(), query_set.end());
+                    q.data(), q.data() + q.size());
 }
 
 std::optional<std::string> DiskMapOfSets::lookup_rec(
-    uint32_t node_id, std::set<std::string>::const_iterator q_begin,
-    std::set<std::string>::const_iterator q_end) {
+    uint32_t node_id, const uint32_t *q_begin, const uint32_t *q_end) {
   if (q_begin == q_end) {
     const auto &node = get_node(node_id);
     if (node.is_end_of_set())
@@ -263,33 +286,37 @@ std::optional<std::string> DiskMapOfSets::lookup_rec(
   }
 
   const auto &node = get_node(node_id);
-  const std::string &target = *q_begin;
+  const uint32_t target = *q_begin;
 
   auto it = std::lower_bound(
       node.children().begin(), node.children().end(), target,
-      [this](const Child &child, const std::string &t) {
-        return key_str(child.key_index()) < t;
+      [](const Child &child, uint32_t t) {
+        return child.key_index() < t;
       });
 
-  if (it == node.children().end() || key_str(it->key_index()) != target)
+  if (it == node.children().end() || it->key_index() != target)
     return std::nullopt;
 
-  return lookup_rec(it->child_id(), std::next(q_begin), q_end);
+  return lookup_rec(it->child_id(), q_begin + 1, q_end);
 }
 
 std::vector<std::string>
-DiskMapOfSets::subsets(const std::set<std::string> &query_set) {
+DiskMapOfSets::subsets(const std::vector<std::string> &query_set) {
   if (!valid_) return {};
+  bool allPresent = false;
+  // For subset search, query strings absent from the table can be dropped: no
+  // stored set contains them, so descending on them would find nothing.
+  std::vector<uint32_t> q = resolveQueryIndices(query_set, allPresent);
   std::vector<std::string> results;
   find_subsets(header_file_.header().root_id(),
-               query_set.begin(), query_set.end(), results);
+               q.data(), q.data() + q.size(), results);
   return results;
 }
 
 void DiskMapOfSets::find_subsets(
     uint32_t node_id,
-    std::set<std::string>::const_iterator q_begin,
-    std::set<std::string>::const_iterator q_end,
+    const uint32_t *q_begin,
+    const uint32_t *q_end,
     std::vector<std::string> &results) {
   // Snapshot before recursing: a recursive call can evict this node's chunk.
   NodeView node = get_node_view(node_id);
@@ -298,47 +325,59 @@ void DiskMapOfSets::find_subsets(
     results.push_back(read_value(node.value_offset));
 
   for (auto q_it = q_begin; q_it != q_end; ++q_it) {
-    const std::string &elt = *q_it;
+    const uint32_t elt = *q_it;
 
     auto child_it = std::lower_bound(
         node.children.begin(), node.children.end(), elt,
-        [this](const ChildRef &c, const std::string &t) {
-          return key_str(c.key_index) < t;
+        [](const ChildRef &c, uint32_t t) {
+          return c.key_index < t;
         });
 
-    if (child_it != node.children.end() &&
-        key_str(child_it->key_index) == elt) {
-      find_subsets(child_it->child_id, std::next(q_it), q_end, results);
+    if (child_it != node.children.end() && child_it->key_index == elt) {
+      find_subsets(child_it->child_id, q_it + 1, q_end, results);
     }
   }
 }
 
 std::vector<std::string>
-DiskMapOfSets::supersets(const std::set<std::string> &query_set) {
+DiskMapOfSets::supersets(const std::vector<std::string> &query_set) {
   if (!valid_) return {};
+  bool allPresent = false;
+  std::vector<uint32_t> q = resolveQueryIndices(query_set, allPresent);
+  // A stored superset must contain every query element; if any query string is
+  // absent from the table, no stored set can contain it, so there are none.
+  if (!allPresent) return {};
   std::vector<std::string> results;
-  std::vector<bool> visited(header_file_.header().total_nodes(), false);
+  // Epoch-stamped cycle guard, reused across calls (audit P1). Size once; bump
+  // the epoch to clear it in O(1). On wraparound reset stamps and skip epoch 0
+  // (an unwritten stamp reads 0 and must not look "visited").
+  uint32_t totalNodes = header_file_.header().total_nodes();
+  if (supersetVisit_.size() < totalNodes)
+    supersetVisit_.assign(totalNodes, 0);
+  if (++supersetVisitEpoch_ == 0) {
+    std::fill(supersetVisit_.begin(), supersetVisit_.end(), 0);
+    supersetVisitEpoch_ = 1;
+  }
   find_supersets(header_file_.header().root_id(),
-                 query_set.begin(), query_set.end(), visited, results);
+                 q.data(), q.data() + q.size(), results);
   return results;
 }
 
 void DiskMapOfSets::find_supersets(
     uint32_t node_id,
-    std::set<std::string>::const_iterator q_begin,
-    std::set<std::string>::const_iterator q_end,
-    std::vector<bool> &visited,
+    const uint32_t *q_begin,
+    const uint32_t *q_end,
     std::vector<std::string> &results) {
   // Cycle guard for malformed files: the branches below can recurse without
   // shrinking the query, so a corrupt child_id cycle would not self-terminate.
-  if (node_id < visited.size()) {
-    if (visited[node_id]) {
+  if (node_id < supersetVisit_.size()) {
+    if (supersetVisit_[node_id] == supersetVisitEpoch_) {
       klee_warning("DiskMapOfSets: cycle detected at node %u during superset "
                    "search; marking cache invalid", node_id);
       valid_ = false;
       return;
     }
-    visited[node_id] = true;
+    supersetVisit_[node_id] = supersetVisitEpoch_;
   }
 
   // Snapshot before recursing: a recursive call can evict this node's chunk.
@@ -349,19 +388,17 @@ void DiskMapOfSets::find_supersets(
       results.push_back(read_value(node.value_offset));
 
     for (const auto &child : node.children)
-      find_supersets(child.child_id, q_begin, q_end, visited, results);
+      find_supersets(child.child_id, q_begin, q_end, results);
   } else {
-    const std::string &elt = *q_begin;
-    auto next_q = std::next(q_begin);
+    const uint32_t elt = *q_begin;
+    const uint32_t *next_q = q_begin + 1;
 
     for (const auto &child : node.children) {
-      const std::string &child_key = key_str(child.key_index);
-
-      if (child_key == elt) {
-        find_supersets(child.child_id, next_q, q_end, visited, results);
-      } else if (child_key < elt) {
+      if (child.key_index == elt) {
+        find_supersets(child.child_id, next_q, q_end, results);
+      } else if (child.key_index < elt) {
         // Extra superset element; follow without advancing the query.
-        find_supersets(child.child_id, q_begin, q_end, visited, results);
+        find_supersets(child.child_id, q_begin, q_end, results);
       } else {
         break; // child_key > elt: remaining sorted children all overshoot.
       }

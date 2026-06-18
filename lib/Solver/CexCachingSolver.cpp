@@ -477,7 +477,7 @@ CexCachingSolver::~CexCachingSolver() {
 void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   std::vector<ref<Expr>> vec(key.begin(), key.end());
   auto [diskKey, canon] =
-      buildConstraintDiskKey(vec, logArrayCache_);
+      buildConstraintDiskKey(std::move(vec), logArrayCache_);
 
   // serializeAssignment guards the SAT path; mirror the cap here so the
   // UNSAT (value="") path does not silently truncate uint8 indices past 255.
@@ -488,7 +488,7 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
     return;
   }
 
-  std::string value = a ? DiskCexCache::serializeAssignment(a, canon.forwardArrayMap)
+  std::string value = a ? DiskCexCache::serializeAssignment(a, canon)
                         : ""; // UNSAT sentinel
 
   // Concrete-array entries are emitted in canonical-index order so the
@@ -496,12 +496,18 @@ void CexCachingSolver::appendToCacheLog(const KeyType &key, Assignment *a) {
   struct ConcreteEntry { uint8_t idx; std::vector<unsigned char> bytes; };
   std::vector<ConcreteEntry> concretes;
   for (const auto &[orig, canon_arr] : canon.forwardArrayMap) {
-    if (!canon_arr->isConstantArray()) continue;
-    uint8_t idx = static_cast<uint8_t>(
-        std::stoi(canon_arr->name.substr(1)));
+    // Canonical arrays are now always symbolic (audit P3), so read concreteness
+    // and the byte values from the ORIGINAL array; the canonical array supplies
+    // only its index.
+    if (!orig->isConstantArray()) continue;
+    // Index carried alongside the canonical array — no name re-parse (audit F8).
+    auto ci = canon.canonIndex.find(canon_arr);
+    uint8_t idx = (ci != canon.canonIndex.end())
+                      ? ci->second
+                      : static_cast<uint8_t>(std::stoi(canon_arr->name.substr(1)));
     std::vector<unsigned char> bytes;
-    bytes.reserve(canon_arr->constantValues.size());
-    for (const auto &cv : canon_arr->constantValues)
+    bytes.reserve(orig->constantValues.size());
+    for (const auto &cv : orig->constantValues)
       bytes.push_back(static_cast<unsigned char>(cv->getZExtValue()));
     concretes.push_back({idx, std::move(bytes)});
   }

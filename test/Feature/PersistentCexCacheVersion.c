@@ -10,10 +10,11 @@
 // RUN: %klee-pcache-opt --log %t.log -o %t.cache
 //
 // Header layout: [u64 magic][u64 header_size][Header protobuf][...]. Inside the
-// protobuf, canonicalization_version (field 5, varint) is encoded as the byte
-// pair 0x28 0x01. Patch it to 0x28 0x02 to force a version mismatch. Verify
-// the marker is unique within the header to avoid corrupting an unrelated field.
-// RUN: python3 -c "d=bytearray(open(r'%t.cache','rb').read()); n=int.from_bytes(d[8:16],'little'); h=bytes(d[16:16+n]); assert h.count(b'\x28\x01')==1, 'canon_version marker not unique'; i=h.index(b'\x28\x01'); d[16+i+1]=0x00; open(r'%t.cache','wb').write(bytes(d))"
+// protobuf, canonicalization_version (field 5, varint) is the current cache
+// version 3, encoded as the byte pair 0x28 0x03. Patch the value byte to 0x00
+// (version 0) to force a version mismatch. Verify the marker is unique within
+// the header to avoid corrupting an unrelated field.
+// RUN: python3 -c "d=bytearray(open(r'%t.cache','rb').read()); n=int.from_bytes(d[8:16],'little'); h=bytes(d[16:16+n]); assert h.count(b'\x28\x03')==1, 'canon_version marker not unique'; i=h.index(b'\x28\x03'); d[16+i+1]=0x00; open(r'%t.cache','wb').write(bytes(d))"
 //
 // Loading the patched cache must produce the version-mismatch warning. KLEE
 // itself continues without the cache, so exit must still be clean.

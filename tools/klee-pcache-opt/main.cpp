@@ -727,16 +727,53 @@ int main(int argc, char **argv) {
 
   std::vector<Conflict> conflicts;
 
+  // Dedup and source tracking keyed by hashKeySet rather than by comparing
+  // whole key-sets of (often long) canonical strings in a std::set<std::set>
+  // (audit N4). Each bucket keeps an exact-equality fallback so a 64-bit hash
+  // collision never drops or mismatches a distinct entry. Pointers alias the
+  // stable key_sets in {sat,unsat}Entries.
+  using KeySetSeen =
+      std::unordered_map<uint64_t, std::vector<const std::set<std::string> *>>;
+  auto seenInsert = [](KeySetSeen &seen,
+                       const std::set<std::string> &ks) -> bool {
+    auto &bucket = seen[hashKeySet(ks)];
+    for (const auto *p : bucket)
+      if (*p == ks)
+        return false; // already present
+    bucket.push_back(&ks);
+    return true;
+  };
+
   // SAT entries first so UNSAT can overwrite on conflict.
-  std::set<std::set<std::string>> satSeen;
-  std::map<std::set<std::string>, std::string> satKeyToSource;
+  KeySetSeen satSeen;
+  std::unordered_map<uint64_t,
+                     std::vector<std::pair<const std::set<std::string> *,
+                                           const std::string *>>>
+      satKeyToSource;
+  auto recordSatSource = [&](const std::set<std::string> &ks,
+                             const std::string &src) {
+    auto &bucket = satKeyToSource[hashKeySet(ks)];
+    for (auto &kv : bucket)
+      if (*kv.first == ks) { kv.second = &src; return; } // last write wins
+    bucket.push_back({&ks, &src});
+  };
+  auto findSatSource = [&](const std::set<std::string> &ks)
+      -> const std::string * {
+    auto it = satKeyToSource.find(hashKeySet(ks));
+    if (it == satKeyToSource.end())
+      return nullptr;
+    for (const auto &kv : it->second)
+      if (*kv.first == ks)
+        return kv.second;
+    return nullptr;
+  };
 
   for (const auto &e : satEntries) {
-    if (dedup && !satSeen.insert(e.key_set).second) {
+    if (dedup && !seenInsert(satSeen, e.key_set)) {
       ++satDuplicates;
       continue;
     }
-    satKeyToSource[e.key_set] = e.source;
+    recordSatSource(e.key_set, e.source);
     result.insert(e.key_set, e.value);
   }
 
@@ -753,10 +790,10 @@ int main(int argc, char **argv) {
   // SAT and UNSAT entries and must not influence dominance.
   MapOfSets<std::string, std::string> unsatTrie;
 
-  std::set<std::set<std::string>> unsatSeen;
+  KeySetSeen unsatSeen;
 
   for (const auto &e : unsatEntries) {
-    if (dedup && !unsatSeen.insert(e.key_set).second) {
+    if (dedup && !seenInsert(unsatSeen, e.key_set)) {
       ++unsatDuplicates;
       continue;
     }
@@ -765,11 +802,11 @@ int main(int argc, char **argv) {
     // Detect it independently of dominance pruning so the conflict is always
     // reported: a dominated UNSAT superset is redundant for lookups, but its
     // contradiction with the SAT entry is still real and must not be hidden.
-    auto satIt = satKeyToSource.find(e.key_set);
-    const bool conflictsWithSat = (satIt != satKeyToSource.end());
+    const std::string *satSrc = findSatSource(e.key_set);
+    const bool conflictsWithSat = (satSrc != nullptr);
     if (conflictsWithSat) {
       ++satConflicts;
-      conflicts.push_back({e.key_set, satIt->second, e.source});
+      conflicts.push_back({e.key_set, *satSrc, e.source});
     }
 
     if (pruneUnsat) {
