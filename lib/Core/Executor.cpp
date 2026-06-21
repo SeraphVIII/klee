@@ -85,6 +85,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cxxabi.h>
 #include <fstream>
@@ -4471,19 +4472,40 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         address = toConstant(state, address, "max-sym-array-size");
       }
 
-      ref<Expr> offset = mo->getOffsetExpr(address);
-      ref<Expr> check = mo->getBoundsCheckOffset(offset, bytes);
-      check = optimizer.optimizeExpr(check, true);
+      // Fast path for a constant address: the offset and the bounds check are
+      // pure integer arithmetic, so we skip constructing the symbolic offset and
+      // bounds-check expressions, the optimiser pass, and the (constant-folding)
+      // bounds-check query.  resolveOne guarantees mo->address <= addr, and the
+      // unsigned arithmetic mirrors getOffsetExpr/getBoundsCheckOffset exactly,
+      // so the resulting offset and in-bounds decision are bit-identical to the
+      // general path.  KLEE_DISABLE_CONSTADDR_FAST=1 restores the general path.
+      static const bool constAddrFastDisabled =
+          std::getenv("KLEE_DISABLE_CONSTADDR_FAST");
 
+      ref<Expr> offset;
       bool inBounds;
-      solver->setTimeout(coreSolverTimeout);
-      bool success = solver->mustBeTrue(state.constraints, check, inBounds,
-                                        state.queryMetaData);
-      solver->setTimeout(time::Span());
-      if (!success) {
-        state.pc = state.prevPC;
-        terminateStateOnSolverError(state, "Query timed out (bounds check).");
-        return;
+
+      ConstantExpr *CA =
+          constAddrFastDisabled ? nullptr : dyn_cast<ConstantExpr>(address);
+      if (CA) {
+        uint64_t o = CA->getZExtValue() - mo->address;
+        inBounds = (bytes <= mo->size) && (o <= mo->size - bytes);
+        if (inBounds)
+          offset = ConstantExpr::create(o, CA->getWidth());
+      } else {
+        offset = mo->getOffsetExpr(address);
+        ref<Expr> check = mo->getBoundsCheckOffset(offset, bytes);
+        check = optimizer.optimizeExpr(check, true);
+
+        solver->setTimeout(coreSolverTimeout);
+        bool success = solver->mustBeTrue(state.constraints, check, inBounds,
+                                          state.queryMetaData);
+        solver->setTimeout(time::Span());
+        if (!success) {
+          state.pc = state.prevPC;
+          terminateStateOnSolverError(state, "Query timed out (bounds check).");
+          return;
+        }
       }
 
       if (inBounds) {

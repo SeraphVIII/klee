@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -58,8 +59,8 @@ public:
     return modified;
   }
 
-  bool intersects(const DenseSet &b) {
-    for (typename set_ty::iterator it = s.begin(), ie = s.end(); 
+  bool intersects(const DenseSet &b) const {
+    for (typename set_ty::const_iterator it = s.begin(), ie = s.end();
          it != ie; ++it)
       if (b.s.count(*it))
         return true;
@@ -184,16 +185,16 @@ public:
   }
 
   // more efficient when this is the smaller set
-  bool intersects(const IndependentElementSet &b) {
+  bool intersects(const IndependentElementSet &b) const {
     // If there are any symbolic arrays in our query that b accesses
-    for (std::set<const Array*>::iterator it = wholeObjects.begin(), 
+    for (std::set<const Array*>::const_iterator it = wholeObjects.begin(),
            ie = wholeObjects.end(); it != ie; ++it) {
       const Array *array = *it;
-      if (b.wholeObjects.count(array) || 
+      if (b.wholeObjects.count(array) ||
           b.elements.find(array) != b.elements.end())
         return true;
     }
-    for (elements_ty::iterator it = elements.begin(), ie = elements.end();
+    for (elements_ty::const_iterator it = elements.begin(), ie = elements.end();
          it != ie; ++it) {
       const Array *array = it->first;
       // if the array we access is symbolic in b
@@ -257,10 +258,44 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
   return os;
 }
 
+// Memoizes the per-constraint IndependentElementSet.  The element set of a
+// constraint is a pure function of its expression, but the original algorithm
+// rebuilt it (a findReads traversal plus map/set construction) for every
+// constraint on every query -- the dominant non-solver cost in the profile.
+// We key the cache on the constraint Expr pointer: the cached entry retains a
+// ref to that same expression (in its `exprs` vector), so the pointer cannot be
+// freed and its address reused while the entry is live, which makes raw-pointer
+// keys sound.  A soft cap bounds memory on long runs; it is enforced only
+// between decompositions (via maybeShrink), never while references handed out
+// during a single decomposition are still in use.
+class IndependentElementSetCache {
+  std::unordered_map<const Expr *, IndependentElementSet> cache_;
+  static const size_t kMaxEntries = 1u << 18; // ~262k distinct constraints
+
+public:
+  void maybeShrink() {
+    if (cache_.size() > kMaxEntries)
+      cache_.clear();
+  }
+
+  // Returns a reference stable across subsequent get()/insertions (node-based
+  // map: rehash does not invalidate element references), but invalidated by
+  // maybeShrink().
+  const IndependentElementSet &get(const ref<Expr> &e) {
+    const Expr *key = e.get();
+    auto it = cache_.find(key);
+    if (it != cache_.end())
+      return it->second;
+    return cache_.emplace(key, IndependentElementSet(e)).first->second;
+  }
+};
+
 // Breaks down a constraint into all of it's individual pieces, returning a
 // list of IndependentElementSets or the independent factors.
 static std::unique_ptr<std::list<IndependentElementSet>>
-getAllIndependentConstraintsSets(const Query &query) {
+getAllIndependentConstraintsSets(const Query &query,
+                                 IndependentElementSetCache &iesCache) {
+  iesCache.maybeShrink();
   auto factors = std::make_unique<std::list<IndependentElementSet>>();
   ConstantExpr *CE = dyn_cast<ConstantExpr>(query.expr);
   if (CE) {
@@ -277,7 +312,9 @@ getAllIndependentConstraintsSets(const Query &query) {
     // evaluated.  If the queue property isn't maintained, then the exprs
     // could be returned in an order different from how they came it, negatively
     // affecting later stages.
-    factors->push_back(IndependentElementSet(constraint));
+    // Copy from the cache: the factors here are mutated by the merge loop
+    // below, so each needs its own instance.
+    factors->push_back(iesCache.get(constraint));
   }
 
   bool doneLoop = false;
@@ -313,25 +350,30 @@ getAllIndependentConstraintsSets(const Query &query) {
   return factors;
 }
 
-static 
+static
 IndependentElementSet getIndependentConstraints(const Query& query,
-                                                std::vector< ref<Expr> > &result) {
+                                                std::vector< ref<Expr> > &result,
+                                                IndependentElementSetCache &iesCache) {
+  iesCache.maybeShrink();
   IndependentElementSet eltsClosure(query.expr);
-  std::vector< std::pair<ref<Expr>, IndependentElementSet> > worklist;
+  // The per-constraint element sets are read-only here (only eltsClosure is
+  // mutated), so we hold cache references rather than copying them.  get() may
+  // insert further entries during this loop, but that does not invalidate
+  // references already taken (node-based map), and maybeShrink ran before any
+  // reference was taken.
+  std::vector< std::pair<ref<Expr>, const IndependentElementSet *> > worklist;
+  worklist.reserve(query.constraints.size());
 
   for (const auto &constraint : query.constraints)
-    worklist.push_back(
-        std::make_pair(constraint, IndependentElementSet(constraint)));
+    worklist.push_back(std::make_pair(constraint, &iesCache.get(constraint)));
 
-  // XXX This should be more efficient (in terms of low level copy stuff).
   bool done = false;
   do {
     done = true;
-    std::vector< std::pair<ref<Expr>, IndependentElementSet> > newWorklist;
-    for (std::vector< std::pair<ref<Expr>, IndependentElementSet> >::iterator
-           it = worklist.begin(), ie = worklist.end(); it != ie; ++it) {
-      if (it->second.intersects(eltsClosure)) {
-        if (eltsClosure.add(it->second))
+    std::vector< std::pair<ref<Expr>, const IndependentElementSet *> > newWorklist;
+    for (auto it = worklist.begin(), ie = worklist.end(); it != ie; ++it) {
+      if (it->second->intersects(eltsClosure)) {
+        if (eltsClosure.add(*it->second))
           done = false;
         result.push_back(it->first);
         // Means that we have added (z=y)added to (x=y)
@@ -385,6 +427,9 @@ void calculateArrayReferences(const IndependentElementSet & ie,
 class IndependentSolver : public SolverImpl {
 private:
   std::unique_ptr<Solver> solver;
+  // Memoizes per-constraint IndependentElementSets across queries.  Lives for
+  // the solver's lifetime; KLEE solving is single-threaded so no locking.
+  IndependentElementSetCache iesCache;
 
 public:
   IndependentSolver(std::unique_ptr<Solver> solver)
@@ -406,25 +451,25 @@ bool IndependentSolver::computeValidity(const Query& query,
                                         Solver::Validity &result) {
   std::vector< ref<Expr> > required;
   IndependentElementSet eltsClosure =
-    getIndependentConstraints(query, required);
+    getIndependentConstraints(query, required, iesCache);
   ConstraintSet tmp(required);
-  return solver->impl->computeValidity(Query(tmp, query.expr), 
+  return solver->impl->computeValidity(Query(tmp, query.expr),
                                        result);
 }
 
 bool IndependentSolver::computeTruth(const Query& query, bool &isValid) {
   std::vector< ref<Expr> > required;
-  IndependentElementSet eltsClosure = 
-    getIndependentConstraints(query, required);
+  IndependentElementSet eltsClosure =
+    getIndependentConstraints(query, required, iesCache);
   ConstraintSet tmp(required);
-  return solver->impl->computeTruth(Query(tmp, query.expr), 
+  return solver->impl->computeTruth(Query(tmp, query.expr),
                                     isValid);
 }
 
 bool IndependentSolver::computeValue(const Query& query, ref<Expr> &result) {
   std::vector< ref<Expr> > required;
-  IndependentElementSet eltsClosure = 
-    getIndependentConstraints(query, required);
+  IndependentElementSet eltsClosure =
+    getIndependentConstraints(query, required, iesCache);
   ConstraintSet tmp(required);
   return solver->impl->computeValue(Query(tmp, query.expr), result);
 }
@@ -474,7 +519,7 @@ bool IndependentSolver::computeInitialValues(const Query& query,
   // we need initial values for requested array objects.
   hasSolution = true;
 
-  auto factors = getAllIndependentConstraintsSets(query);
+  auto factors = getAllIndependentConstraintsSets(query, iesCache);
 
   // Used to rearrange all of the answers into the correct order
   std::map<const Array*, std::vector<unsigned char> > retMap;

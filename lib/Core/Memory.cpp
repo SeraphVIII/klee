@@ -32,6 +32,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 DISABLE_WARNING_POP
 
 #include <cassert>
+#include <cstdlib>
 #include <sstream>
 
 using namespace llvm;
@@ -492,6 +493,36 @@ ref<Expr> ObjectState::read(size_t offset, Expr::Width width) const {
   // Otherwise, follow the slow general case.
   size_t NumBytes = width / 8;
   assert(width == NumBytes * 8 && "Invalid width for read size!");
+
+  // Fast path (default on): when every byte in the range is concrete -- the
+  // common case -- assemble the value directly from concreteStore rather than
+  // building NumBytes Int8 ConstantExprs and folding them pairwise through
+  // ConcatExpr::create (each fold allocates an intermediate wider ConstantExpr
+  // and runs a dyn_cast/isa/Concat over APInts).  The produced ConstantExpr is
+  // exactly the constant that the Concat chain folds to, so the result is
+  // bit-identical.  KLEE_DISABLE_CONCRETE_READ_FAST=1 restores the byte-by-byte
+  // path for A/B verification.
+  static const bool fastDisabled =
+      std::getenv("KLEE_DISABLE_CONCRETE_READ_FAST");
+  if (!fastDisabled && width <= 64) {
+    bool allConcrete = true;
+    for (size_t i = 0; i < NumBytes; ++i) {
+      if (!isByteConcrete(offset + i)) {
+        allConcrete = false;
+        break;
+      }
+    }
+    if (allConcrete) {
+      const bool littleEndian = Context::get().isLittleEndian();
+      uint64_t value = 0;
+      for (size_t i = 0; i < NumBytes; ++i) {
+        unsigned shift = littleEndian ? (8 * i) : (8 * (NumBytes - i - 1));
+        value |= static_cast<uint64_t>(concreteStore[offset + i]) << shift;
+      }
+      return ConstantExpr::create(value, width);
+    }
+  }
+
   ref<Expr> Res(0);
   for (size_t i = 0; i != NumBytes; ++i) {
     size_t idx = Context::get().isLittleEndian() ? i : (NumBytes - i - 1);

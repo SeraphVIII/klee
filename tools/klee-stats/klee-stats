@@ -59,6 +59,10 @@ Legend = [
     ('QCacheHits', 'Query cache hits', "QueryCacheHits"),
     ('QCexCacheMisses', 'Counterexample cache misses', "QueryCexCacheMisses"),
     ('QCexCacheHits', 'Counterexample cache hits', "QueryCexCacheHits"),
+    # - persistent (on-disk) counterexample cache
+    ('DCexCacheMisses', 'persistent (on-disk) counterexample cache misses', "QueryCexDiskCacheMisses"),
+    ('DCexCacheHits', 'persistent (on-disk) counterexample cache hits', "QueryCexDiskCacheHits"),
+    ('DCexHitRate(%)', 'persistent (on-disk) counterexample cache hit rate', "DiskCexHitRate"),
     # - memory
     ('Allocations', 'number of allocated heap objects of the program under test', "Allocations"),
     ('Mem(MiB)', 'mebibytes of memory currently used', "MallocUsage"),
@@ -173,6 +177,10 @@ def select_columns(record, pr):
     elif pr == 'more':
         s_column = ['Path', 'Instructions', 'WallTime', 'ICov', 'BCov', 'ICount',
                   'RelSolverTime', 'NumStates', 'MaxStates', 'MallocUsage', 'MaxMem']
+    elif pr == 'diskcache':
+        s_column = ['Path', 'Instructions', 'ICov', 'Queries', 'SolverQueries',
+                  'QueryCexDiskCacheHits', 'QueryCexDiskCacheMisses', 'DiskCexHitRate',
+                  'SolverTime', 'WallTime']
     else:
         s_column = ['Path', 'Instructions', 'WallTime', 'ICov',
                   'BCov', 'ICount', 'RelSolverTime']
@@ -209,6 +217,12 @@ def add_artificial_columns(record):
         record["BCov"] = 100.0
         if record["NumBranches"] != 0:
             record["BCov"] *= (2 * record["FullBranches"] + record["PartialBranches"]) / (2 * record["NumBranches"])
+
+    # Calculate persistent (on-disk) cex cache hit rate
+    if "QueryCexDiskCacheHits" in record and "QueryCexDiskCacheMisses" in record:
+        dHits = record["QueryCexDiskCacheHits"]
+        dMisses = record["QueryCexDiskCacheMisses"]
+        record["DiskCexHitRate"] = 100 * dHits / max(1, dHits + dMisses)
 
     # Add relative times
     for key in ["SolverTime", "CexCacheTime", "ForkTime", "ResolveTime", "UserTime"]:
@@ -533,6 +547,11 @@ def main():
                           action='store_true', dest='pMore',
                           help='Print extra information (needed when '
                           'monitoring an ongoing run).')
+    pControl.add_argument('--print-disk-cache',
+                          action='store_true', dest='pDiskCache',
+                          help='Print persistent (on-disk) counterexample cache '
+                          'statistics (hits / misses / hit-rate) alongside query '
+                          'and solver-time columns.')
     pControl.add_argument('--print-columns', type=str, dest='columns', default=None,
                           help='Comma-separated list of table columns, e.g \'Path,Time(s),ICov(%%)\'.')
 
@@ -556,6 +575,8 @@ def main():
         pr = 'abstime'
     elif args.pMore:
         pr = 'more'
+    elif args.pDiskCache:
+        pr = 'diskcache'
 
     dirs = getKleeOutDirs(args.dir)
     if len(dirs) == 0:

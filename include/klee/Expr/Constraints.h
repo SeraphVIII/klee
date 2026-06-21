@@ -67,8 +67,11 @@ public:
 private:
   /// Rewrite set of constraints using the visitor
   /// \param visitor constraint rewriter
+  /// \param filterSrc subexpression the visitor substitutes; constraints that
+  ///        provably do not contain it are left untouched (skips the visit).
+  ///        A null ref disables the filter (every constraint is visited).
   /// \return true iff any constraint has been changed
-  bool rewriteConstraints(ExprVisitor &visitor);
+  bool rewriteConstraints(ExprVisitor &visitor, const ref<Expr> &filterSrc);
 
   /// Add constraint to the set of constraints
   void addConstraintInternal(const ref<Expr> &constraint);

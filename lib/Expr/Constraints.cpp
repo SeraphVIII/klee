@@ -9,6 +9,7 @@
 
 #include "klee/Expr/Constraints.h"
 
+#include "klee/Expr/ExprHashMap.h"
 #include "klee/Expr/ExprVisitor.h"
 #include "klee/Module/KModule.h"
 #include "klee/Support/OptionCategories.h"
@@ -16,11 +17,75 @@
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
 
-#include <map>
+#include <algorithm>
+#include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace klee;
 
 namespace {
+// Behaviour-preserving accelerator for ConstraintManager::rewriteConstraints.
+//
+// When an equality `const == X` is added, every existing constraint is visited
+// to substitute X with the constant.  Profiling (printf 300k) shows ~99.5% of
+// those visits touch a constraint that does not contain X at all: the whole
+// expression tree is walked and the constraint returned unchanged.  A
+// constraint `ce` can contain `X` only if X's structural hash occurs among
+// ce's subexpression hashes, so we cache, per constraint expression, the sorted
+// unique set of its subexpression hashes and skip the (expensive) visit
+// whenever X's hash is absent.  A hash collision merely causes a redundant —
+// still correct — visit, so the produced constraint set is byte-identical.
+//
+// The cache is keyed by Expr* and each entry pins its key with a ref<Expr>, so
+// the pointer cannot be freed and reused while the entry is live (same safety
+// argument as the IndependentElementSet cache in IndependentSolver.cpp).
+class SubExprHashIndex {
+  struct Entry {
+    ref<Expr> pin;                // keeps the key Expr* alive (no stale reuse)
+    std::vector<unsigned> hashes; // sorted, unique subexpression hashes
+  };
+  std::unordered_map<const Expr *, Entry> cache_;
+  static const size_t kMaxEntries = 1u << 18; // ~262k constraints, then drop
+
+  static void collect(const Expr *e, std::vector<unsigned> &out,
+                      std::unordered_set<const Expr *> &seen) {
+    if (!seen.insert(e).second)
+      return; // shared subtree already accounted for (DAG dedup)
+    out.push_back(e->hash());
+    for (unsigned i = 0, n = e->getNumKids(); i < n; ++i)
+      collect(e->getKid(i).get(), out, seen);
+  }
+
+  const std::vector<unsigned> &signatureOf(const ref<Expr> &e) {
+    const Expr *key = e.get();
+    auto it = cache_.find(key);
+    if (it != cache_.end())
+      return it->second.hashes;
+    if (cache_.size() > kMaxEntries)
+      cache_.clear();
+    Entry entry;
+    entry.pin = e;
+    std::unordered_set<const Expr *> seen;
+    collect(key, entry.hashes, seen);
+    std::sort(entry.hashes.begin(), entry.hashes.end());
+    entry.hashes.erase(std::unique(entry.hashes.begin(), entry.hashes.end()),
+                       entry.hashes.end());
+    return cache_.emplace(key, std::move(entry)).first->second.hashes;
+  }
+
+public:
+  // Conservative containment test.  false => `needle` is provably not a
+  // subexpression of `haystack`; true => it might be (caller must confirm via
+  // the actual visit).
+  bool mayContain(const ref<Expr> &haystack, const ref<Expr> &needle) {
+    const std::vector<unsigned> &h = signatureOf(haystack);
+    return std::binary_search(h.begin(), h.end(), needle->hash());
+  }
+};
+SubExprHashIndex g_subExprIndex;
+
 llvm::cl::opt<bool> RewriteEqualities(
     "rewrite-equalities",
     llvm::cl::desc("Rewrite existing constraints when an equality with a "
@@ -54,11 +119,14 @@ public:
 
 class ExprReplaceVisitor2 : public ExprVisitor {
 private:
-  const std::map< ref<Expr>, ref<Expr> > &replacements;
+  // Pure lookup table (never iterated for order), so an unordered map keyed by
+  // the expression's cached hash replaces the old std::map that ordered keys by
+  // the (expensive) structural Expr::compare.  Lookups become O(1) cached-hash
+  // instead of O(log n) structural comparisons.
+  const ExprHashMap<ref<Expr>> &replacements;
 
 public:
-  explicit ExprReplaceVisitor2(
-      const std::map<ref<Expr>, ref<Expr>> &_replacements)
+  explicit ExprReplaceVisitor2(const ExprHashMap<ref<Expr>> &_replacements)
       : ExprVisitor(true), replacements(_replacements) {}
 
   Action visitExprPost(const Expr &e) override {
@@ -70,12 +138,27 @@ public:
   }
 };
 
-bool ConstraintManager::rewriteConstraints(ExprVisitor &visitor) {
+bool ConstraintManager::rewriteConstraints(ExprVisitor &visitor,
+                                           const ref<Expr> &filterSrc) {
   ConstraintSet old;
   bool changed = false;
 
+  // Ablation switch (default on): KLEE_DISABLE_RWC_FILTER=1 restores the
+  // original visit-every-constraint behaviour, for A/B verification.
+  static const bool filterEnabled = !std::getenv("KLEE_DISABLE_RWC_FILTER");
+
   std::swap(constraints, old);
   for (auto &ce : old) {
+    // A constraint can only change if it contains the substituted subexpression.
+    // When it provably does not, skip the visit and keep it verbatim — this is
+    // exactly the path the visit would have taken (returns ce unchanged), so the
+    // resulting set is identical, just without the wasted tree walk.
+    if (filterEnabled && filterSrc.get() &&
+        !g_subExprIndex.mayContain(ce, filterSrc)) {
+      constraints.push_back(ce);
+      continue;
+    }
+
     ref<Expr> e = visitor.visit(ce);
 
     if (e!=ce) {
@@ -95,7 +178,9 @@ ref<Expr> ConstraintManager::simplifyExpr(const ConstraintSet &constraints,
   if (isa<ConstantExpr>(e))
     return e;
 
-  std::map< ref<Expr>, ref<Expr> > equalities;
+  // First-insertion-wins (insert never overwrites), matching the previous
+  // std::map; only the key ordering changed, which this table does not rely on.
+  ExprHashMap<ref<Expr>> equalities;
 
   for (auto &constraint : constraints) {
     if (const EqExpr *ee = dyn_cast<EqExpr>(constraint)) {
@@ -142,7 +227,7 @@ void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
       BinaryExpr *be = cast<BinaryExpr>(e);
       if (isa<ConstantExpr>(be->left)) {
 	ExprReplaceVisitor visitor(be->right, be->left);
-	rewriteConstraints(visitor);
+	rewriteConstraints(visitor, be->right);
       }
     }
     constraints.push_back(e);
